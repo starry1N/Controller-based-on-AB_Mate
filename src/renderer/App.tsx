@@ -41,7 +41,12 @@ const App: React.FC = () => {
     // 设置事件监听
     protocolRef.current.on('onConnected', () => {
       setConnectionState(ConnectionState.CONNECTED);
-      console.log('设备已连接');
+      // 连接成功后获取设备名称
+      const deviceName = bleServiceRef.current?.getDeviceName();
+      if (deviceName) {
+        setDeviceInfo((prev) => ({ ...prev, name: deviceName }));
+      }
+      console.log('设备已连接:', deviceName);
     });
 
     protocolRef.current.on('onDisconnected', () => {

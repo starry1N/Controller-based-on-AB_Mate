@@ -24,6 +24,22 @@ export class ABMateProtocol {
   private deviceInfo: Partial<ABMateDeviceInfo> = {};
   private callbacks: Partial<ABMateEvents> = {};
 
+  // 响应等待队列：序列号 => Promise
+  private pendingRequests: Map<number, {
+    resolve: (data: Uint8Array) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+  }> = new Map();
+
+  /**
+   * 获取下一个序列号（0-255）
+   */
+  private getNextSeq(): number {
+    const currentSeq = this.seq & 0xFF;  // 确保在 0-255 范围内
+    this.seq = (this.seq + 1) & 0xFF;
+    return currentSeq;
+  }
+
   constructor(bleService: BLEService) {
     this.bleService = bleService;
 
@@ -42,13 +58,23 @@ export class ABMateProtocol {
    * 连接设备
    */
   async connect(): Promise<void> {
-    await this.bleService.scanAndConnect();
-    this.callbacks.onConnected?.();
-    
-    // 连接成功后查询设备信息
-    setTimeout(() => {
-      this.queryDeviceInfo();
-    }, 500);
+    try {
+      console.log('🔄 开始连接设备...');
+      await this.bleService.scanAndConnect();
+      console.log('✅ 设备已连接');
+
+      this.callbacks.onConnected?.();
+      
+      // 连接成功后查询设备信息
+      setTimeout(() => {
+        console.log('📤 延迟 500ms 后发送初始查询...');
+        this.queryDeviceInfo();
+      }, 500);
+    } catch (error) {
+      console.error('❌ 连接失败:', error);
+      this.callbacks.onError?.(error as Error);
+      throw error;
+    }
   }
 
   /**
@@ -172,7 +198,8 @@ export class ABMateProtocol {
    * 设备复位
    */
   async resetDevice(): Promise<void> {
-    const packet = this.buildPacket(ABMateCommand.DEVICE_RESET, ABMateCommandType.REQUEST, new Uint8Array([]));
+    // DEVICE_RESET 需要一个参数（通常为 0x00）
+    const packet = this.buildPacket(ABMateCommand.DEVICE_RESET, ABMateCommandType.REQUEST, new Uint8Array([0x00]));
     await this.sendPacket(packet);
   }
 
@@ -204,16 +231,17 @@ export class ABMateProtocol {
    * 构建 AB-Mate 数据包
    */
   private buildPacket(cmd: ABMateCommand, type: ABMateCommandType, payload: Uint8Array): Uint8Array {
+    const seq = this.getNextSeq();  // 使用正确的序列号管理
     const headerLen = 5;
     const totalLen = headerLen + 1 + payload.length; // header + cmd + payload
     const packet = new Uint8Array(totalLen);
 
     // Header
-    packet[0] = (AB_MATE_CONSTANTS.TAG >> 8) & 0xff; // TAG high byte
-    packet[1] = AB_MATE_CONSTANTS.TAG & 0xff; // TAG low byte
-    packet[2] = type;
-    packet[3] = this.seq++;
-    packet[4] = payload.length + 1; // len = cmd (1 byte) + payload
+    packet[0] = (AB_MATE_CONSTANTS.TAG >> 8) & 0xff; // TAG high byte (0xAB)
+    packet[1] = AB_MATE_CONSTANTS.TAG & 0xff;        // TAG low byte  (0x23)
+    packet[2] = type;                                  // Type (REQUEST/RESPONSE/NOTIFY)
+    packet[3] = seq;                                   // Seq (0-255, 循环)
+    packet[4] = payload.length + 1;                    // Len = cmd(1) + payload(n)
 
     // Command
     packet[5] = cmd;
@@ -227,15 +255,71 @@ export class ABMateProtocol {
   }
 
   /**
+   * 发送数据包并等待响应
+   */
+  private async sendAndWait(packet: Uint8Array, timeoutMs: number = 5000): Promise<Uint8Array | null> {
+    const seq = packet[3]; // 获取序列号
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(seq);
+        console.warn(`❌ 命令超时（序列号: ${seq}），设备无响应`);
+        this.callbacks.onError?.(new Error('设备无响应，请检查连接'));
+        resolve(null);
+      }, timeoutMs);
+
+      this.pendingRequests.set(seq, {
+        resolve: (data) => {
+          clearTimeout(timeout);
+          resolve(data);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          this.callbacks.onError?.(error);
+          resolve(null);
+        },
+        timeout,
+      });
+
+      // 发送数据包
+      this.bleService.writeWithoutResponse(packet).catch((error) => {
+        clearTimeout(timeout);
+        this.pendingRequests.delete(seq);
+        this.callbacks.onError?.(error as Error);
+        resolve(null);
+      });
+
+      const cmd = packet[5];
+      const len = packet[4];
+      console.log(`📤 发送命令: [TAG:AB23] [Type:${packet[2]}] [Seq:${seq}] [Len:${len}] [Cmd:0x${cmd.toString(16).padStart(2, '0')}]`);
+      console.log(`   完整数据: ${Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+    });
+  }
+
+  /**
    * 发送数据包
    */
   private async sendPacket(packet: Uint8Array): Promise<void> {
     try {
+      const cmd = packet[5];
+      const len = packet[4];
+      const seq = packet[3];
+      const type = packet[2];
+      
+      const rawHex = Array.from(packet)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join(' ');
+
+      console.log(
+        `📤 发送数据包: [Seq:${seq}] [Type:${type}] [Len:${len}] [Cmd:0x${cmd.toString(16).padStart(2, '0')}]`
+      );
+      console.log(`   完整数据: ${rawHex}`);
+
       // 优先使用快速写入（无响应）
       await this.bleService.writeWithoutResponse(packet);
-      console.log('发送数据包:', Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join(' '));
+      console.log(`   ✓ 已发送到特征 0xFF17`);
     } catch (error) {
-      console.error('发送数据包失败:', error);
+      console.error('❌ 发送数据包失败:', error);
       this.callbacks.onError?.(error as Error);
     }
   }
@@ -245,14 +329,36 @@ export class ABMateProtocol {
    */
   private handleReceivedData(data: DataView): void {
     try {
+      // 原始数据日志
+      const rawData = Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join(' ');
+      console.log(`📥 收到原始数据 (${data.byteLength} 字节): ${rawData}`);
+
       // 解析数据包
       const packet = this.parsePacket(data);
       
-      console.log('收到数据包:', {
-        type: packet.type,
-        cmd: packet.cmd,
-        payload: Array.from(packet.payload)
+      console.log('📋 数据包结构:', {
+        TAG: `0x${packet.tag.toString(16).padStart(4, '0')}`,
+        Type: packet.type === 2 ? 'RESPONSE' : packet.type === 3 ? 'NOTIFY' : `UNKNOWN(${packet.type})`,
+        Seq: packet.seq,
+        Len: packet.len,
+        Cmd: `0x${packet.cmd.toString(16).padStart(2, '0')}`,
+        PayloadLen: packet.payload.length,
+        Payload: packet.payload.length > 0 
+          ? Array.from(packet.payload).map(b => b.toString(16).padStart(2, '0')).join(' ')
+          : '(空)'
       });
+
+      // 检查是否有待处理的请求
+      if (packet.type === ABMateCommandType.RESPONSE && this.pendingRequests.has(packet.seq)) {
+        const pending = this.pendingRequests.get(packet.seq)!;
+        this.pendingRequests.delete(packet.seq);
+        pending.resolve(packet.payload);
+        console.log(`✅ 序列号 ${packet.seq} 的请求已匹配响应`);
+      } else if (packet.type === ABMateCommandType.RESPONSE) {
+        console.warn(`⚠️  收到响应但无对应的待处理请求 (Seq: ${packet.seq})`);
+      }
 
       // 根据命令类型处理
       if (packet.type === ABMateCommandType.RESPONSE) {
@@ -261,7 +367,7 @@ export class ABMateProtocol {
         this.handleNotify(packet);
       }
     } catch (error) {
-      console.error('解析数据包失败:', error);
+      console.error('❌ 解析数据包失败:', error);
       this.callbacks.onError?.(error as Error);
     }
   }
@@ -273,15 +379,29 @@ export class ABMateProtocol {
     const tag = (data.getUint8(0) << 8) | data.getUint8(1);
     
     if (tag !== AB_MATE_CONSTANTS.TAG) {
-      throw new Error(`无效的数据包标签: 0x${tag.toString(16)}`);
+      throw new Error(`❌ 无效的数据包标签: 0x${tag.toString(16)}`);
+    }
+
+    if (data.byteLength < 6) {
+      throw new Error(`❌ 数据包过短: ${data.byteLength} 字节`);
+    }
+
+    const type = data.getUint8(2);
+    const seq = data.getUint8(3);
+    const len = data.getUint8(4);
+    const cmd = data.getUint8(5);
+
+    // 验证长度
+    if (data.byteLength < 6 + len - 1) {
+      console.warn(`⚠️  数据包不完整: 声明长度${len}，实际${data.byteLength - 5}`);
     }
 
     return {
       tag,
-      type: data.getUint8(2) as ABMateCommandType,
-      seq: data.getUint8(3),
-      len: data.getUint8(4),
-      cmd: data.getUint8(5) as ABMateCommand,
+      type: type as ABMateCommandType,
+      seq,
+      len,
+      cmd: cmd as ABMateCommand,
       payload: new Uint8Array(data.buffer, data.byteOffset + 6, data.byteLength - 6),
     };
   }
@@ -291,11 +411,62 @@ export class ABMateProtocol {
    */
   private handleResponse(packet: ABMatePacket): void {
     const result = packet.payload[0] as ABMateResult;
+    const cmdHex = `0x${packet.cmd.toString(16).padStart(2, '0')}`;
     
     if (result === ABMateResult.SUCCESS) {
-      console.log(`命令 0x${packet.cmd.toString(16)} 执行成功`);
+      console.log(`✅ 命令 ${cmdHex} 执行成功`);
     } else {
-      console.warn(`命令 0x${packet.cmd.toString(16)} 执行失败`);
+      console.warn(`⚠️  命令 ${cmdHex} 执行失败，错误码: ${result}`);
+    }
+
+    // 处理特定命令的响应
+    this.handleCommandResponse(packet);
+  }
+
+  /**
+   * 处理特定命令的响应数据
+   */
+  private handleCommandResponse(packet: ABMatePacket): void {
+    const { cmd, payload } = packet;
+
+    try {
+      switch (cmd) {
+        case ABMateCommand.DEVICE_INFO_GET:
+        case ABMateCommand.DEVICE_INFO_NOTIFY:
+          this.parseDeviceInfo(payload);
+          break;
+
+        case ABMateCommand.EQ_GET:
+        case ABMateCommand.EQ_NOTIFY:
+          if (payload.length >= 11) {
+            const mode = payload[0];
+            const gains = Array.from(payload.slice(1, 11)).map(g => g - 12);
+            this.callbacks.onEQChanged?.({ mode, gains });
+            console.log(`🎵 EQ 已更新: 模式=${mode}, 增益=${gains}`);
+          }
+          break;
+
+        case ABMateCommand.BATT_GET:
+        case ABMateCommand.BATT_NOTIFY:
+          if (payload.length >= 3) {
+            this.callbacks.onBatteryUpdated?.(payload[0], payload[1], payload[2]);
+            console.log(`🔋 电池: L=${payload[0]}% R=${payload[1]}% Case=${payload[2]}%`);
+          }
+          break;
+
+        case ABMateCommand.ANC_LEVEL_GET:
+        case ABMateCommand.ANC_LEVEL_NOTIFY:
+          if (payload.length >= 2) {
+            this.callbacks.onANCModeChanged?.(payload[0], payload[1]);
+            console.log(`🔊 ANC: 模式=${payload[0]} 等级=${payload[1]}`);
+          }
+          break;
+
+        default:
+          console.log(`📦 收到命令 ${`0x${cmd.toString(16)}`.padStart(4, '0x')} 响应`);
+      }
+    } catch (error) {
+      console.error(`❌ 处理命令响应失败:`, error);
     }
   }
 

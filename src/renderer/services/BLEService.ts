@@ -61,6 +61,23 @@ export class BLEService {
       console.log('正在连接 GATT 服务器...');
       this.server = await this.device.gatt!.connect();
 
+      // 如果扫描时未获取名称，从 Generic Access 服务读取
+      if (!this.device.name || this.device.name === '') {
+        try {
+          const gasService = await this.server.getPrimaryService('generic_access');
+          const nameChar = await gasService.getCharacteristic('device_name');
+          const value = await nameChar.readValue();
+          const name = new TextDecoder().decode(value);
+          if (name) {
+            console.log('从 GATT 获取设备名称:', name);
+            // 更新设备名称
+            (this.device as any).name = name;
+          }
+        } catch (e) {
+          console.log('从 Generic Access 读取设备名称失败，使用默认名称');
+        }
+      }
+
       console.log('正在获取 AB-Mate 服务...');
       this.service = await this.server.getPrimaryService(
         this.uuidTo128Bit(AB_MATE_CONSTANTS.SERVICE_UUID)
@@ -78,8 +95,17 @@ export class BLEService {
       this.writeChar = writeChar;
       this.writeCmdChar = writeCmdChar;
 
+      // 验证特征属性
+      console.log('特征属性验证:');
+      console.log(`  Notify (0xFF18): 支持Notify=${notifyChar.properties.notify}, 支持Read=${notifyChar.properties.read}`);
+      console.log(`  Write (0xFF16): 支持Write=${writeChar.properties.write}, 支持Read=${writeChar.properties.read}`);
+      console.log(`  WriteCmd (0xFF17): 支持WriteWithoutResponse=${writeCmdChar.properties.writeWithoutResponse}, 支持Write=${writeCmdChar.properties.write}`);
+
       // 订阅通知
+      console.log('正在订阅 Notify 特征...');
       await this.notifyChar.startNotifications();
+      console.log('✅ Notify 订阅成功，开始监听数据...');
+      
       this.notifyChar.addEventListener('characteristicvaluechanged', (event) => {
         const target = event.target as BluetoothRemoteGATTCharacteristic;
         const value = target.value!;
@@ -134,7 +160,12 @@ export class BLEService {
   isConnected(): boolean {
     return this.server?.connected ?? false;
   }
-
+  /**
+   * 获取设备名称
+   */
+  getDeviceName(): string {
+    return this.device?.name || '未知设备';
+  }
   /**
    * 获取设备信息
    */

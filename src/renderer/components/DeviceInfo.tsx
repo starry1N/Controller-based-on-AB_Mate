@@ -34,6 +34,26 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
 
   return (
     <div className="device-info">
+      {/* 设备名称 */}
+      {deviceInfo.name && (
+        <div className="device-name-section">
+          <div className="device-name-header">
+            <h2>📱 {deviceInfo.name}</h2>
+            <button
+              className="action-btn find-btn"
+              onClick={() => onFindDevice('both')}
+              title="向设备播放声音以确认连接"
+            >
+              <span className="action-icon">🔔</span>
+              <span className="action-label">播放声音</span>
+            </button>
+          </div>
+          {deviceInfo.firmwareVersion && (
+            <p className="device-version">固件版本: {deviceInfo.firmwareVersion}</p>
+          )}
+        </div>
+      )}
+
       {/* 电池信息 */}
       <div className="battery-section">
         <h3>🔋 电池状态</h3>
