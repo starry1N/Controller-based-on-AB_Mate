@@ -19,6 +19,8 @@ function createWindow() {
       contextIsolation: true,
       enableRemoteModule: false,
       preload: path.join(__dirname, 'preload.js'),
+      // 启用 Web Bluetooth API
+      enableBlinkFeatures: 'WebBluetooth',
     },
   });
 
@@ -32,6 +34,32 @@ function createWindow() {
 
   // 总是打开开发者工具
   mainWindow.webContents.openDevTools();
+
+  // 处理蓝牙设备选择请求
+  mainWindow.webContents.session.on('select-bluetooth-device', (event, deviceList, callback) => {
+    event.preventDefault();
+    
+    console.log('[主进程] 蓝牙设备列表:', deviceList);
+    
+    // 如果有设备，选择第一个
+    if (deviceList.length > 0) {
+      callback(deviceList[0].deviceId);
+    } else {
+      callback('');
+    }
+  });
+
+  // 处理蓝牙配对请求
+  mainWindow.webContents.session.setBluetoothPairingHandler((details, callback) => {
+    console.log('[主进程] 蓝牙配对请求:', details);
+    
+    // 自动确认配对
+    if (details.pairingKind === 'confirm') {
+      callback({ confirmed: true });
+    } else if (details.pairingKind === 'confirmPin') {
+      callback({ confirmed: true, pin: details.pin });
+    }
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;

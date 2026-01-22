@@ -1,78 +1,140 @@
-.App {
-  text-align: center;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
-}
-
-.App-header {
-  background-color: rgba(0, 0, 0, 0.1);
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
-  padding: 40px;
-  border-radius: 10px;
-}
-
-.App-header h1 {
-  font-size: 2.5rem;
-  margin-bottom: 1rem;
-  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
-}
-
-.App-header p {
-  font-size: 1.2rem;
-  margin-bottom: 2rem;
-  opacity: 0.9;
-}
-
-.features {
-  background-color: rgba(255, 255, 255, 0.1);
-  padding: 2rem;
-  border-radius: 8px;
-  backdrop-filter: blur(10px);
-}
-
-.features h2 {
-  font-size: 1.5rem;
-  margin-bottom: 1rem;
-}
-
-.features ul {
-  list-style: none;
+* {
+  box-sizing: border-box;
+  margin: 0;
   padding: 0;
-  font-size: 1.1rem;
 }
 
-.features li {
-  margin: 0.5rem 0;
-  transition: transform 0.3s ease;
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-.features li:hover {
-  transform: translateX(10px);
+.App {
+  min-height: 100vh;
+  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  padding: 20px;
 }
 
-@media (prefers-reduced-motion: no-preference) {
+.app-header {
+  text-align: center;
+  margin-bottom: 30px;
+  padding: 20px;
+}
+
+.app-header h1 {
+  font-size: 32px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 8px;
+}
+
+.app-subtitle {
+  color: #6b7280;
+  font-size: 14px;
+}
+
+.app-container {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.welcome-message {
+  background: white;
+  border-radius: 16px;
+  padding: 60px 40px;
+  text-align: center;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+}
+
+.welcome-icon {
+  font-size: 80px;
+  margin-bottom: 20px;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.1);
+  }
+}
+
+.welcome-message h2 {
+  color: #1f2937;
+  font-size: 24px;
+  margin-bottom: 12px;
+}
+
+.welcome-message p {
+  color: #6b7280;
+  font-size: 16px;
+  margin-bottom: 32px;
+}
+
+.features-list {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+  max-width: 500px;
+  margin: 0 auto;
+}
+
+.feature-item {
+  padding: 12px 20px;
+  background: linear-gradient(to right, #f9fafb, #f3f4f6);
+  border-radius: 8px;
+  color: #4b5563;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.app-footer {
+  text-align: center;
+  margin-top: 40px;
+  padding: 20px;
+  color: #9ca3af;
+  font-size: 12px;
+}
+
+@media (max-width: 768px) {
   .App {
-    animation: AppFade 0.5s ease-in;
+    padding: 10px;
+  }
+
+  .app-header h1 {
+    font-size: 24px;
+  }
+
+  .features-list {
+    grid-template-columns: 1fr;
+  }
+
+  .welcome-message {
+    padding: 40px 20px;
   }
 }
 
-@keyframes AppFade {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
 }

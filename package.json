@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "@types/web-bluetooth": "^0.0.20"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

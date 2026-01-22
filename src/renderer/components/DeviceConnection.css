@@ -1,0 +1,124 @@
+.device-connection {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 16px;
+  padding: 24px;
+  margin-bottom: 20px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+}
+
+.status-indicator {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  margin-right: 12px;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.connection-status.disconnected .status-indicator {
+  background: #9ca3af;
+  animation: none;
+}
+
+.connection-status.connecting .status-indicator {
+  background: #f59e0b;
+}
+
+.connection-status.connected .status-indicator {
+  background: #10b981;
+}
+
+.connection-status.error .status-indicator {
+  background: #ef4444;
+  animation: none;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.2);
+  }
+}
+
+.status-info {
+  flex: 1;
+  color: white;
+}
+
+.status-text {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.device-name {
+  font-size: 14px;
+  opacity: 0.9;
+}
+
+.connection-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.btn-connect,
+.btn-disconnect {
+  flex: 1;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.btn-connect {
+  background: white;
+  color: #667eea;
+}
+
+.btn-connect:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.btn-connect:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-disconnect {
+  background: rgba(239, 68, 68, 0.9);
+  color: white;
+}
+
+.btn-disconnect:hover {
+  background: rgba(239, 68, 68, 1);
+  transform: translateY(-2px);
+}
+
+.error-message {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 8px;
+  color: white;
+  font-size: 14px;
+  text-align: center;
+}
