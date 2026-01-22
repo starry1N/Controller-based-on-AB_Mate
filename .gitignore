@@ -1,0 +1,9 @@
+.env.local
+.vscode
+dist
+build
+coverage
+node_modules
+*.log
+.DS_Store
+*.pem
