@@ -24,7 +24,7 @@ export enum ABMateCommandType {
 // 命令 ID 枚举
 export enum ABMateCommand {
   EQ_SET = 0x20,
-  MUSIC_SET = 0x21,
+  MUSIC_SET = 0x21,           // 音乐控制（包括音量）
   KEY_SET = 0x22,
   POWER_OFF_SET = 0x23,
   DEVICE_RESET = 0x24,
@@ -33,14 +33,15 @@ export enum ABMateCommand {
   DEVICE_INFO_GET = 0x27,
   DEVICE_INFO_NOTIFY = 0x28,
   LANGUAGE_SET = 0x29,
-  BT_NAME_SET = 0x2a,
-  LED_SET = 0x2b,
+  DEVICE_FIND = 0x2a,         // 设备查找
+  AUTO_ANSWER_SET = 0x2b,
   ANC_SET = 0x2c,
-  VOL_SET = 0x2d,
-  ANC_LEVEL_SET = 0x2e,
-  TP_LEVEL_SET = 0x2f,
-  V3D_AUDIO_SET = 0x30,
-  DEVICE_FIND = 0x31,
+  BT_NAME_SET = 0x2d,         // 蓝牙名称
+  LED_SET = 0x2e,
+  BT_LINK_INFO_CLEAR = 0x2f,
+  ANC_LEVEL_SET = 0x30,
+  TP_LEVEL_SET = 0x31,
+  V3D_AUDIO_SET = 0x32,
 }
 
 // ANC 模式枚举

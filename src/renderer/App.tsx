@@ -72,6 +72,10 @@ const App: React.FC = () => {
       setEQConfig(config);
     });
 
+    protocolRef.current.on('onVolumeChanged', (volume) => {
+      setDeviceInfo((prev) => ({ ...prev, volume }));
+    });
+
     protocolRef.current.on('onError', (error) => {
       console.error('协议错误:', error);
       alert(`错误: ${error.message}`);
@@ -140,10 +144,16 @@ const App: React.FC = () => {
   };
 
   const handleVolumeChange = async (volume: number) => {
+    // ✅ 立即更新本地UI（乐观更新）
+    setDeviceInfo((prev) => ({ ...prev, volume }));
+    
     try {
+      // 异步发送命令到设备
       await protocolRef.current?.setVolume(volume);
     } catch (error) {
       console.error('设置音量失败:', error);
+      // 如果失败，需要回退UI到之前的值
+      // 但目前保持为用户设置的值，因为setVolume中会同步更新
     }
   };
 
