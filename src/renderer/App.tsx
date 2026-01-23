@@ -76,9 +76,32 @@ const App: React.FC = () => {
       setDeviceInfo((prev) => ({ ...prev, volume }));
     });
 
+    protocolRef.current.on('onANCModeChanged', (mode, level) => {
+      setDeviceInfo((prev) => ({ ...prev, ancMode: mode, ancLevel: level }));
+    });
+
     protocolRef.current.on('onError', (error) => {
       console.error('协议错误:', error);
-      alert(`错误: ${error.message}`);
+      
+      // 检查是否为 GATT 操作错误
+      if (error.message && error.message.includes('GATT operation already in progress')) {
+        console.warn('⚠️  检测到 GATT 操作冲突，正在尝试同步设备...');
+        
+        // 尝试同步设备
+        if (protocolRef.current) {
+          protocolRef.current.syncWithDevice().then((success) => {
+            if (success) {
+              console.log('✅ 设备同步成功，连接已恢复');
+              // 不显示错误弹窗，继续运行
+            } else {
+              console.error('❌ 设备同步失败');
+              alert(`连接错误: ${error.message}\n请重新连接设备`);
+            }
+          });
+        }
+      } else {
+        alert(`错误: ${error.message}`);
+      }
     });
 
     return () => {
@@ -120,15 +143,24 @@ const App: React.FC = () => {
   };
 
   const handleANCModeChange = async (mode: ABMateANCMode) => {
+    // ✅ 立即更新本地UI（乐观更新）
+    setDeviceInfo((prev) => ({ ...prev, ancMode: mode }));
+    
     try {
+      // 异步发送命令到设备
       await protocolRef.current?.setANCMode(mode);
     } catch (error) {
       console.error('设置 ANC 模式失败:', error);
+      // 失败时UI会通过响应处理回退
     }
   };
 
   const handleANCLevelChange = async (level: number) => {
+    // ✅ 立即更新本地UI（乐观更新）
+    setDeviceInfo((prev) => ({ ...prev, ancLevel: level }));
+    
     try {
+      // 异步发送命令到设备
       await protocolRef.current?.setANCLevel(level);
     } catch (error) {
       console.error('设置 ANC 等级失败:', error);
@@ -136,7 +168,11 @@ const App: React.FC = () => {
   };
 
   const handleTPLevelChange = async (level: number) => {
+    // ✅ 立即更新本地UI（乐观更新）
+    setDeviceInfo((prev) => ({ ...prev, tpLevel: level }));
+    
     try {
+      // 异步发送命令到设备
       await protocolRef.current?.setTransparencyLevel(level);
     } catch (error) {
       console.error('设置透传等级失败:', error);

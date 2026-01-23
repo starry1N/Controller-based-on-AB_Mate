@@ -31,21 +31,29 @@ export class ABMateProtocol {
     timeout: NodeJS.Timeout;
   }> = new Map();
 
+  // 发送队列：确保命令按顺序发送（使用双向队列优化）
+  private sendQueue: Array<{
+    packet: Uint8Array;
+    resolve: (data: Uint8Array | null) => void;
+    reject: (error: Error) => void;
+    timeoutMs: number;
+    cmd: number;  // 命令码，用于去重优化
+    priority?: boolean;  // 是否优先处理
+  }> = [];
+  private isSending: boolean = false;
+  private maxQueueSize: number = 10;  // 队列最大长度
+
   /**
    * 获取下一个序列号（0-15 循环）
    * 注意：序列号是 4 位字段，范围应该是 0-15
    * 
-   * ⚠️ 关键逻辑更新：
-   * 设备在**发送每个数据包前都会递增SEQ**（包括初始化查询、响应和通知）
-   * 为了与设备SEQ同步，APP也应该在**发送前递增**，而不是发送后递增
-   * 
-   * 旧逻辑：返回当前值，然后递增 → getNextSeq() 返回 0,1,2...
-   * 新逻辑：先递增，然后返回 → getNextSeq() 返回 1,2,3...
+   * ⚠️ 关键逻辑：
+   * 初始查询SEQ为0（不递增），之后每次发送APP会递增SEQ
+   * 设备对初始查询的响应SEQ也是0，对后续请求的响应SEQ = 请求SEQ
    */
   private getNextSeq(): number {
-    this.seq = (this.seq + 1) & 0x0F;   // 先递增（0-15循环）
-    const nextSeq = this.seq & 0x0F;    // 返回递增后的值
-    return nextSeq;
+    // 返回当前SEQ，发送数据包后再递增
+    return this.seq;
   }
 
   constructor(bleService: BLEService) {
@@ -200,19 +208,20 @@ export class ABMateProtocol {
    */
   async setVolume(volume: number): Promise<void> {
     const vol = Math.max(0, Math.min(100, volume));
+    
+    // ✅ 乐观UI：立即更新本地音量值，不等待设备响应
+    this.deviceInfo.volume = vol;
+    this.callbacks.onVolumeChanged?.(vol);
+    
     const payload = new Uint8Array([
       0x01,  // Type: A2DP_CTL_VOICE (音量控制)
       0x01,  // Length: 1字节
       vol    // Value: 音量值 0-100
     ]);
     const packet = this.buildPacket(ABMateCommand.MUSIC_SET, ABMateCommandType.REQUEST, payload);
-    await this.sendAndWait(packet);
     
-    // ✅ 命令成功发送后，立即更新本地音量值和触发回调
-    // 不能依赖响应中的值，因为响应只包含错误码，不包含音量值
-    this.deviceInfo.volume = vol;
-    this.callbacks.onVolumeChanged?.(vol);
-    console.log(`🔊 音量已设置: ${vol}%`);
+    // 使用高优先级发送，快速滑动时会去重
+    await this.sendAndWaitWithPriority(packet, 5000, true);
   }
 
   /**
@@ -472,12 +481,238 @@ export class ABMateProtocol {
   }
 
   /**
-   * 发送数据包并等待响应
+   * 同步设备连接状态和序列号
+   * 当发生 GATT 错误时调用此方法来重新对齐 APP 和设备的 SEQ
+   * 
+   * 原理：通过查询一个简单的信息（MTU）来验证连接
+   * 设备响应会包含当前的序列号，APP可以据此重新计算正确的SEQ
+   */
+  async syncWithDevice(): Promise<boolean> {
+    try {
+      console.log('🔄 开始同步设备连接状态...');
+      
+      // 等待100ms让BLE恢复
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // 查询MTU来确认连接
+      const response = await this.queryDeviceInfoWithSync([0xFF]);  // 0xFF = INFO_MTU
+      
+      if (response) {
+        console.log('✅ 设备同步成功，连接已恢复');
+        return true;
+      } else {
+        console.warn('❌ 设备同步失败，连接可能已断开');
+        return false;
+      }
+    } catch (error) {
+      console.error('❌ 同步过程错误:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 带同步的设备信息查询
+   * 用于恢复 GATT 错误后重新同步序列号
+   */
+  private async queryDeviceInfoWithSync(infoTypes: number[]): Promise<Uint8Array | null> {
+    try {
+      // 构建 TLV 载荷
+      const payload = new Uint8Array(infoTypes.length * 2);
+      for (let i = 0; i < infoTypes.length; i++) {
+        payload[i * 2] = infoTypes[i];      // 信息类型
+        payload[i * 2 + 1] = 0;             // 长度=0（查询）
+      }
+
+      const packet = this.buildPacket(
+        ABMateCommand.DEVICE_INFO_GET,
+        ABMateCommandType.REQUEST,
+        payload
+      );
+      
+      // 记录发送前的SEQ
+      const sendSeq = packet[2] & 0x0F;
+      console.log(`   📤 同步查询 SEQ=${sendSeq}, 期望响应 SEQ=${sendSeq}`);
+      
+      const response = await this.sendAndWait(packet, 3000);
+      if (response) {
+        console.log(`   ✅ 收到同步响应，共 ${response.length} 字节`);
+        return response;
+      } else {
+        console.warn(`   ⚠️  同步查询超时，SEQ=${sendSeq}`);
+        return null;
+      }
+    } catch (error) {
+      console.error('   ❌ 同步查询异常:', error);
+      return null;
+    }
+  }
+
+  /**
+   * 发送数据包并等待响应（带队列管理和 GATT 错误处理）
    */
   private async sendAndWait(packet: Uint8Array, timeoutMs: number = 5000): Promise<Uint8Array | null> {
+    return new Promise((resolve, reject) => {
+      // 提取命令码
+      const cmd = packet.length >= 4 ? packet[3] : 0;
+      
+      // 将请求加入队列
+      this.sendQueue.push({
+        packet,
+        resolve,
+        reject,
+        timeoutMs,
+        cmd,
+      });
+
+      // 触发队列处理
+      this.processSendQueue();
+    });
+  }
+
+  /**
+   * 发送高优先级数据包（用于音量等需要去重的命令）
+   */
+  private async sendAndWaitWithPriority(
+    packet: Uint8Array, 
+    timeoutMs: number = 5000,
+    deduplicate: boolean = false
+  ): Promise<Uint8Array | null> {
+    return new Promise((resolve, reject) => {
+      const cmd = packet.length >= 4 ? packet[3] : 0;
+      
+      // 🔥 智能去重：如果是音量命令，移除队列中旧的音量命令
+      if (deduplicate && cmd === ABMateCommand.MUSIC_SET) {
+        const removedCount = this.sendQueue.length;
+        this.sendQueue = this.sendQueue.filter(item => {
+          // 保留非音量命令
+          if (item.cmd !== ABMateCommand.MUSIC_SET) {
+            return true;
+          }
+          // 拒绝旧的音量命令（避免 Promise 悬挂）
+          item.reject(new Error('Command superseded by newer volume command'));
+          return false;
+        });
+        
+        if (removedCount > this.sendQueue.length) {
+          console.log(`🗑️ 移除 ${removedCount - this.sendQueue.length} 个过时的音量命令`);
+        }
+      }
+      
+      // 队列长度限制（保留最新的命令）
+      if (this.sendQueue.length >= this.maxQueueSize) {
+        const oldest = this.sendQueue.shift();
+        oldest?.reject(new Error('Queue overflow - command dropped'));
+        console.warn(`⚠️ 队列已满，丢弃最旧命令`);
+      }
+      
+      // 将请求加入队列
+      this.sendQueue.push({
+        packet,
+        resolve,
+        reject,
+        timeoutMs,
+        cmd,
+        priority: true,
+      });
+
+      // 触发队列处理
+      this.processSendQueue();
+    });
+  }
+
+  /**
+   * 处理发送队列（确保命令按顺序发送）
+   */
+  private async processSendQueue(): Promise<void> {
+    // 如果正在发送，等待当前发送完成
+    if (this.isSending) {
+      return;
+    }
+
+    // 如果队列为空，退出
+    if (this.sendQueue.length === 0) {
+      return;
+    }
+
+    // 标记为正在发送
+    this.isSending = true;
+
+    // 取出队列头部的请求
+    const request = this.sendQueue.shift()!;
+    const { packet, resolve, reject, timeoutMs } = request;
+
+    try {
+      const seq = packet[2] & 0x0F;
+      let retryCount = 0;
+      const maxRetries = 3;
+
+      while (retryCount < maxRetries) {
+        try {
+          const result = await this.sendAndWaitInternal(packet, timeoutMs);
+          resolve(result);
+          break; // 成功，退出重试循环
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          
+          // 检查是否为 GATT operation already in progress 错误
+          if (errorMsg.includes('GATT operation already in progress')) {
+            retryCount++;
+            console.warn(`⚠️  GATT 操作正在进行中 (${retryCount}/${maxRetries})，等待后重试...`);
+            
+            if (retryCount < maxRetries) {
+              // 等待一段时间后重试
+              await new Promise(r => setTimeout(r, 300 * retryCount));
+              continue;
+            } else {
+              console.error(`❌ GATT 操作重试 ${maxRetries} 次后仍失败，尝试同步...`);
+              // 最后一次重试失败，尝试同步
+              const syncSuccess = await this.syncWithDevice();
+              if (!syncSuccess) {
+                this.callbacks.onError?.(new Error('GATT 连接异常，设备可能已断开'));
+                resolve(null);
+                break;
+              }
+              // 同步成功后再重试一次
+              retryCount++;
+              if (retryCount < maxRetries) {
+                const result = await this.sendAndWaitInternal(packet, timeoutMs);
+                resolve(result);
+                break;
+              }
+            }
+          } else {
+            // 其他错误直接拒绝
+            reject(error instanceof Error ? error : new Error(String(error)));
+            break;
+          }
+        }
+      }
+      
+      // 如果达到最大重试次数仍失败
+      if (retryCount >= maxRetries) {
+        resolve(null);
+      }
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      // 标记为发送完成
+      this.isSending = false;
+
+      // 处理队列中的下一个请求
+      if (this.sendQueue.length > 0) {
+        // 短暂延迟后处理下一个，避免发送过快
+        setTimeout(() => this.processSendQueue(), 10);
+      }
+    }
+  }
+
+  /**
+   * 实际的发送和等待实现
+   */
+  private async sendAndWaitInternal(packet: Uint8Array, timeoutMs: number = 5000): Promise<Uint8Array | null> {
     const seq = packet[2] & 0x0F; // 获取序列号（字节2的位0-3）
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         // 超时处理 - 仔细检查是否确实存在该请求
         if (this.pendingRequests.has(seq)) {
@@ -508,8 +743,7 @@ export class ABMateProtocol {
         },
         reject: (error) => {
           clearTimeout(timeout);
-          this.callbacks.onError?.(error);
-          resolve(null);
+          reject(error);
         },
         timeout,
       });
@@ -518,9 +752,10 @@ export class ABMateProtocol {
       this.bleService.writeWithoutResponse(packet).catch((error) => {
         clearTimeout(timeout);
         this.pendingRequests.delete(seq);
-        this.callbacks.onError?.(error as Error);
-        resolve(null);
+        reject(error);
       });
+      // 发送后递增SEQ
+      this.seq = (this.seq + 1) & 0x0F;
 
       const cmd = packet[3];
       const type = packet[4];
@@ -528,7 +763,7 @@ export class ABMateProtocol {
       const frameTotal = (packet[5] >> 4) & 0x0F;
       const payloadLen = packet[6];
       console.log(`📤 发送命令: [TAG:AB23] [SEQ:${seq}] [CMD:0x${cmd.toString(16).padStart(2, '0')}] [TYPE:${type}] [FRAME:${frameSeq}/${frameTotal}] [PAYLOAD_LEN:${payloadLen}]`);
-      console.log(`   内部SEQ计数: ${this.seq}（当前循环位置，应该在0-15范围）`);
+      console.log(`   下一个SEQ值: ${this.seq}（已递增）`);
       console.log(`   待处理请求SEQ: [${Array.from(this.pendingRequests.keys()).join(', ')}]`);
       console.log(`   完整数据: ${Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
     });
@@ -635,56 +870,30 @@ export class ABMateProtocol {
       });
 
       // 检查是否有待处理的请求
-      // ⚠️ SEQ同步逻辑更新：
-      // APP现在采用"发送前递增"，所以：
-      // - APP发送SEQ=1,2,3...的请求
-      // - 设备也在发送前递增，所以响应的SEQ = (待处理SEQ + 设备额外递增次数)
-      // 
-      // 设备的SEQ递增包括：
-      // 1. 初始化时的查询响应（设备初始SEQ会+1）
-      // 2. 每次发送响应前都会+1
-      // 
-      // 因此，响应匹配需要考虑设备已经额外递增的次数
+      // ⚠️ SEQ同步逻辑：
+      // - 初始查询SEQ=0，设备响应SEQ也=0（无递增）
+      // - 之后APP每发送一个命令就递增SEQ，设备响应的SEQ = 请求SEQ
+      // - 精确匹配：响应SEQ = 待处理请求SEQ
       let matchedSeq: number | null = null;
       
       if (packet.type === ABMateCommandType.RESPONSE) {
         const pendingSeqs = Array.from(this.pendingRequests.keys());
         console.log(`   待处理请求SEQ列表: ${pendingSeqs.length === 0 ? '[]（无待处理）' : '[' + pendingSeqs.join(', ') + ']'}`);
         
-        // 由于设备的初始化查询会导致SEQ额外递增一次，
-        // 响应SEQ通常 = 请求SEQ + 1（或其他固定偏移）
-        // 尝试多个可能的匹配：
-        
-        // 1. 精确匹配（理论上不太可能，除非SEQ完全同步）
+        // 策略1: 精确匹配：响应SEQ = 请求SEQ
         if (this.pendingRequests.has(packet.seq)) {
           matchedSeq = packet.seq;
           console.log(`   ✓ 序列号精确匹配: ${packet.seq}`);
-        } else {
-          // 2. 最常见：响应SEQ = 请求SEQ + 1（或更多）
-          const seqMinus1 = (packet.seq - 1) & 0x0F;
-          if (this.pendingRequests.has(seqMinus1)) {
-            matchedSeq = seqMinus1;
-            console.log(`   ✓ 序列号 (-1) 匹配: 待处理SEQ=${seqMinus1} 对应响应SEQ=${packet.seq}`);
-          } else {
-            // 3. 设备额外递增：响应SEQ = 请求SEQ + 2
-            const seqMinus2 = (packet.seq - 2) & 0x0F;
-            if (this.pendingRequests.has(seqMinus2)) {
-              matchedSeq = seqMinus2;
-              console.log(`   ✓ 序列号 (-2) 匹配: 待处理SEQ=${seqMinus2} 对应响应SEQ=${packet.seq}`);
-            } else {
-              // 4. 更多额外递增的情况
-              const seqMinus3 = (packet.seq - 3) & 0x0F;
-              if (this.pendingRequests.has(seqMinus3)) {
-                matchedSeq = seqMinus3;
-                console.log(`   ✓ 序列号 (-3) 匹配: 待处理SEQ=${seqMinus3} 对应响应SEQ=${packet.seq}`);
-              } else {
-                console.warn(`   ❌ 序列号完全匹配失败！`);
-                console.warn(`      收到响应SEQ=${packet.seq}`);
-                console.warn(`      尝试的SEQ值: ${packet.seq}, ${seqMinus1}, ${seqMinus2}, ${seqMinus3}`);
-                console.warn(`      待处理请求SEQ=${pendingSeqs.length === 0 ? '[]' : '[' + pendingSeqs.join(', ') + ']'}`);
-              }
-            }
-          }
+        } 
+        // 策略2: 如果精确匹配失败且有待处理请求，使用最早的请求（FIFO）
+        else if (pendingSeqs.length > 0) {
+          matchedSeq = pendingSeqs[0]; // 取第一个（最早的）
+          console.warn(`   ⚠️  SEQ不匹配，使用FIFO策略: 响应SEQ=${packet.seq}, 匹配最早的请求SEQ=${matchedSeq}`);
+        } 
+        else {
+          console.warn(`   ❌ 序列号匹配失败！`);
+          console.warn(`      收到响应SEQ=${packet.seq}`);
+          console.warn(`      待处理请求SEQ=${pendingSeqs.length === 0 ? '[]' : '[' + pendingSeqs.join(', ') + ']'}`);
         }
 
         if (matchedSeq !== null) {
@@ -692,7 +901,7 @@ export class ABMateProtocol {
           this.pendingRequests.delete(matchedSeq);
           clearTimeout(pending?.timeout);
           pending?.resolve(packet.payload);
-          console.log(`✅ 序列号 ${matchedSeq} 的请求已匹配响应 (返回值 Seq: ${packet.seq})`);
+          console.log(`✅ 序列号 ${matchedSeq} 的请求已匹配响应`);
         } else {
           console.warn(
             `⚠️  收到响应但无对应的待处理请求\n` +
@@ -708,7 +917,7 @@ export class ABMateProtocol {
             // DEVICE_INFO_NOTIFY
             console.warn(`   💡 可能原因: 这是一个主动通知，不是响应`);
           } else {
-            console.warn(`   💡 序列号对应失败，可能是设备端SEQ管理异常`);
+            console.warn(`   💡 序列号对应失败，可能是SEQ同步异常`);
           }
         }
       }
@@ -716,8 +925,13 @@ export class ABMateProtocol {
       // 根据命令类型处理
       if (packet.type === ABMateCommandType.RESPONSE) {
         this.handleResponse(packet);
+        // ⚠️ RESPONSE类型：SEQ不递增，因为这是对APP发送的命令的响应
+        console.log(`   📥 收到RESPONSE（SEQ不递增）: ${packet.seq}`);
       } else if (packet.type === ABMateCommandType.NOTIFY) {
         this.handleNotify(packet);
+        // ⚠️ NOTIFY类型：SEQ递增，因为这是设备主动发送的通知，相当于一次新的通信
+        this.seq = (this.seq + 1) & 0x0F;
+        console.log(`   📢 收到NOTIFY（SEQ递增）: ${packet.seq} → APP_SEQ: ${this.seq}`);
       }
     } catch (error) {
       console.error('❌ 解析数据包失败:', error);
@@ -903,6 +1117,19 @@ export class ABMateProtocol {
           }
           break;
 
+        case ABMateCommand.ANC_SET:
+          // ANC_SET 响应仅包含错误码（1字节）
+          // 实际的ANC模式值已在 setANCMode() 中同步更新
+          if (payload.length >= 1) {
+            const resultCode = payload[0];
+            if (resultCode === ABMateResult.SUCCESS) {
+              console.log(`✅ ANC 模式设置成功`);
+            } else {
+              console.warn(`⚠️  ANC 模式设置失败，错误码: ${resultCode}`);
+            }
+          }
+          break;
+
         case ABMateCommand.MUSIC_SET:
           // 音量命令响应格式: [控制类型][长度][错误码]
           // 注意：响应中不包含音量值，只包含错误码
@@ -1014,6 +1241,9 @@ export class ABMateProtocol {
 
         let typeStr = '未知';
         let logValue = '';
+        
+        // 原始数据的十六进制表示
+        const rawHex = Array.from(data).map(b => b.toString(16).padStart(2, '0')).join(' ');
 
         switch (type) {
           case 0x01: // INFO_POWER - 电池电量
@@ -1110,7 +1340,28 @@ export class ABMateProtocol {
 
           case 0x23: // INFO_BT_STA - 蓝牙连接状态
             typeStr = 'INFO_BT_STA (蓝牙状态)';
-            logValue = data[0] === 1 ? '已连接' : '未连接';
+            // 蓝牙状态码定义（来自固件 api_btstack.h）
+            const btStates: { [key: number]: string } = {
+              0: 'OFF (模块已关闭)',
+              1: 'INITING (初始化中)',
+              2: 'IDLE (打开，未连接)',
+              3: 'SCANNING (扫描中)',
+              4: 'DISCONNECTING (断开中)',
+              5: 'CONNECTING (连接中)',
+              6: 'CONNECTED (已连接)', // ← 状态码 0x06
+              7: 'PLAYING (播放中)',
+              8: 'INCOMING (来电响铃)',
+              9: 'OUTGOING (正在呼出)',
+              10: 'INCALL (通话中)',
+              11: 'RES (保留)',
+              12: 'OTA (OTA升级中)',
+            };
+            logValue = btStates[data[0]] || `未知 (0x${data[0].toString(16).padStart(2, '0')})`;
+            // 如果有扩展数据（电话号码等），一并显示
+            if (len > 1) {
+              const extData = Array.from(data.slice(1)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+              logValue += ` [扩展数据: ${extData}]`;
+            }
             break;
 
           case 0xfe: // INFO_DEV_CAP - 设备能力
@@ -1129,7 +1380,8 @@ export class ABMateProtocol {
         }
 
         parsedItems.push({ type, typeStr, length: len, value: logValue });
-        console.log(`   ✓ ${typeStr}: ${logValue}`);
+        console.log(`   ✓ TYPE:0x${type.toString(16).padStart(2, '0')} ${typeStr}`);
+        console.log(`     长度:${len}B 原始:${rawHex} 解析:${logValue}`);
       }
 
       console.log(`✅ 设备信息解析完成，共 ${parsedItems.length} 项`);
