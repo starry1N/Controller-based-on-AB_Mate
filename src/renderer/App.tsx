@@ -194,14 +194,23 @@ const App: React.FC = () => {
   };
 
   const handleToggleMode = async () => {
+    // 确定要切换到的新模式
+    const currentMode = deviceInfo.deviceMode || ABMateDeviceMode.NORMAL;
     const newMode =
-      deviceInfo.deviceMode === ABMateDeviceMode.GAME
+      currentMode === ABMateDeviceMode.GAME
         ? ABMateDeviceMode.NORMAL
         : ABMateDeviceMode.GAME;
+
     try {
+      console.log(
+        `🎮 切换模式: ${currentMode === ABMateDeviceMode.GAME ? '游戏' : '普通'} → ${newMode === ABMateDeviceMode.GAME ? '游戏' : '普通'}`
+      );
+      // setDeviceMode 会自动进行乐观更新，所以不需要在这里再更新
       await protocolRef.current?.setDeviceMode(newMode);
+      console.log('✅ 模式切换成功');
     } catch (error) {
-      console.error('切换模式失败:', error);
+      console.error('❌ 切换模式失败:', error);
+      throw error; // 抛出错误以便 UI 可以恢复
     }
   };
 

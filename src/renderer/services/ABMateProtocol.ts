@@ -228,6 +228,10 @@ export class ABMateProtocol {
    * 设置工作模式（普通/游戏）
    */
   async setDeviceMode(mode: ABMateDeviceMode): Promise<void> {
+    // 立即同步本地设备状态（乐观更新）
+    console.log(`[setDeviceMode] Switching to: ${mode === ABMateDeviceMode.GAME ? 'GAME' : 'NORMAL'}`);
+    this.deviceInfo.deviceMode = mode;
+    
     const payload = new Uint8Array([mode]);
     const packet = this.buildPacket(ABMateCommand.MODE_SET, ABMateCommandType.REQUEST, payload);
     await this.sendAndWait(packet);
@@ -262,13 +266,69 @@ export class ABMateProtocol {
 
   /**
    * 设备查找（蜂鸣）
+   * @param side 查找类型：
+   *   - 'stop': 停止所有查找 (payload=0x00)
+   *   - 'both': 两耳同时蜂鸣 (payload=0x01)
+   *   - 'left': 启动左耳蜂鸣 (payload=0x02)
+   *   - 'right': 启动右耳蜂鸣 (payload=0x04)
+   * 
+   * ⚠️ 注意：设备固件中的payload值定义如下:
+   *   DEVICE_FIND_STOP = 0x00      // 停止查找
+   *   DEVICE_FIND_START = 0x01     // 全设备查找
+   *   DEVICE_FIND_START_L = 0x02   // 启动左耳
+   *   DEVICE_FIND_STOP_L = 0x03    // 停止左耳
+   *   DEVICE_FIND_START_R = 0x04   // 启动右耳
+   *   DEVICE_FIND_STOP_R = 0x05    // 停止右耳
    */
-  async findDevice(side: 'left' | 'right' | 'both'): Promise<void> {
+  async findDevice(side: 'left' | 'right' | 'both' | 'stop'): Promise<void> {
     let payload: number;
     switch (side) {
-      case 'left': payload = 1; break;
-      case 'right': payload = 2; break;
-      case 'both': payload = 3; break;
+      case 'stop': payload = 0x00; break;   // DEVICE_FIND_STOP
+      case 'both': payload = 0x01; break;   // DEVICE_FIND_START
+      case 'left': payload = 0x02; break;   // DEVICE_FIND_START_L
+      case 'right': payload = 0x04; break;  // DEVICE_FIND_START_R
+      default: throw new Error(`Invalid side: ${side}`);
+    }
+    const packet = this.buildPacket(ABMateCommand.DEVICE_FIND, ABMateCommandType.REQUEST, new Uint8Array([payload]));
+    await this.sendAndWait(packet);
+  }
+
+  /**
+   * 启动设备查找
+   * 对应的停止操作使用 stopFindDevice()
+   * 
+   * @param target 查找目标：
+   *   - 'left': 启动左耳蜂鸣 (DEVICE_FIND_START_L = 0x02)
+   *   - 'right': 启动右耳蜂鸣 (DEVICE_FIND_START_R = 0x04)
+   *   - 'both': 两耳同时蜂鸣 (DEVICE_FIND_START = 0x01)
+   */
+  async startFindDevice(target: 'left' | 'right' | 'both'): Promise<void> {
+    let payload: number;
+    switch (target) {
+      case 'both': payload = 0x01; break;   // DEVICE_FIND_START
+      case 'left': payload = 0x02; break;   // DEVICE_FIND_START_L
+      case 'right': payload = 0x04; break;  // DEVICE_FIND_START_R
+      default: throw new Error(`Invalid target: ${target}`);
+    }
+    const packet = this.buildPacket(ABMateCommand.DEVICE_FIND, ABMateCommandType.REQUEST, new Uint8Array([payload]));
+    await this.sendAndWait(packet);
+  }
+
+  /**
+   * 停止设备查找
+   * 
+   * @param target 停止目标：
+   *   - 'left': 停止左耳蜂鸣 (DEVICE_FIND_STOP_L = 0x03)
+   *   - 'right': 停止右耳蜂鸣 (DEVICE_FIND_STOP_R = 0x05)
+   *   - 'all': 停止所有查找 (DEVICE_FIND_STOP = 0x00)
+   */
+  async stopFindDevice(target: 'left' | 'right' | 'all' = 'all'): Promise<void> {
+    let payload: number;
+    switch (target) {
+      case 'all': payload = 0x00; break;    // DEVICE_FIND_STOP
+      case 'left': payload = 0x03; break;   // DEVICE_FIND_STOP_L
+      case 'right': payload = 0x05; break;  // DEVICE_FIND_STOP_R
+      default: throw new Error(`Invalid target: ${target}`);
     }
     const packet = this.buildPacket(ABMateCommand.DEVICE_FIND, ABMateCommandType.REQUEST, new Uint8Array([payload]));
     await this.sendAndWait(packet);
@@ -1142,6 +1202,22 @@ export class ABMateProtocol {
               console.warn(`⚠️  音量设置失败，错误码: ${resultCode}`);
             }
           }
+          break;
+
+        case ABMateCommand.MODE_SET:
+          // MODE_SET 响应仅包含错误码（1字节）
+          // 实际的模式值已在 setDeviceMode() 中同步更新
+          if (payload.length >= 1) {
+            const resultCode = payload[0];
+            if (resultCode === ABMateResult.SUCCESS) {
+              console.log(`✅ 设备模式设置成功，当前模式: ${this.deviceInfo.deviceMode === ABMateDeviceMode.GAME ? '游戏' : '普通'}`);
+              // 触发回调确保UI更新
+              this.callbacks.onDeviceInfoUpdated?.(this.deviceInfo);
+            } else {
+              console.warn(`⚠️  设备模式设置失败，错误码: ${resultCode}`);
+            }
+          }
+          break;
           break;
 
         default:

@@ -83,6 +83,17 @@ export enum ABMateKeyFunction {
   ANC_SWITCH = 10,
 }
 
+// 设备查找类型枚举（payload 值定义）
+// 对应设备固件中的 enum { DEVICE_FIND_STOP, DEVICE_FIND_START, ... }
+export enum ABMateDeviceFindType {
+  STOP = 0x00,           // 停止所有查找
+  START = 0x01,          // 全设备查找（两耳+充电盒）
+  START_L = 0x02,        // 启动左耳查找
+  STOP_L = 0x03,         // 停止左耳查找
+  START_R = 0x04,        // 启动右耳查找
+  STOP_R = 0x05,         // 停止右耳查找
+}
+
 // AB-Mate 数据包结构
 export interface ABMatePacket {
   tag: number; // 0xab23
