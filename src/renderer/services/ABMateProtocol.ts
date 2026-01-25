@@ -160,12 +160,14 @@ export class ABMateProtocol {
    * 设置 EQ
    */
   async setEQ(config: ABMateEQConfig): Promise<void> {
-    const payload = new Uint8Array(11);
-    payload[0] = config.mode;
+    // ✅ 修复：12字节payload格式 [band_cnt][mode][gain0-gain9]
+    const payload = new Uint8Array(12);
+    payload[0] = 10;  // band_cnt = 10
+    payload[1] = config.mode;  // mode
     
     // 10 段增益值 (-12 到 +12 转换为 0-24)
     for (let i = 0; i < 10; i++) {
-      payload[i + 1] = Math.max(0, Math.min(24, config.gains[i] + 12));
+      payload[i + 2] = Math.max(0, Math.min(24, config.gains[i] + 12));
     }
 
     const packet = this.buildPacket(ABMateCommand.EQ_SET, ABMateCommandType.REQUEST, payload);

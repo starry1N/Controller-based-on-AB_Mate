@@ -95,17 +95,7 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
       {/* 设备名称 */}
       {deviceInfo.bluetoothName && (
         <div className="device-name-section">
-          <div className="device-name-header">
-            <h2>📱 {deviceInfo.bluetoothName}</h2>
-            <button
-              className="action-btn find-btn"
-              onClick={() => handleFindDevice('both')}
-              title="向设备播放声音以确认连接"
-            >
-              <span className="action-icon">🔔</span>
-              <span className="action-label">播放声音</span>
-            </button>
-          </div>
+          <h2>📱 {deviceInfo.bluetoothName}</h2>
           {deviceInfo.firmwareVersion && (
             <p className="device-version">固件版本: {deviceInfo.firmwareVersion}</p>
           )}

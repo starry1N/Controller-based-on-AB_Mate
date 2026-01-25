@@ -39,14 +39,25 @@ const App: React.FC = () => {
     protocolRef.current = new ABMateProtocol(bleServiceRef.current);
 
     // 设置事件监听
-    protocolRef.current.on('onConnected', () => {
+    protocolRef.current.on('onConnected', async () => {
       setConnectionState(ConnectionState.CONNECTED);
-      // 连接成功后获取设备名称
-      const deviceName = bleServiceRef.current?.getDeviceName();
-      if (deviceName) {
-        setDeviceInfo((prev) => ({ ...prev, name: deviceName }));
+      
+      // 先用 BLE 设备名称作为临时值
+      const bleDeviceName = bleServiceRef.current?.getDeviceName();
+      if (bleDeviceName) {
+        setDeviceInfo((prev) => ({ ...prev, bluetoothName: bleDeviceName }));
       }
-      console.log('设备已连接:', deviceName);
+      
+      // 连接成功后查询设备信息（包括蓝牙名称、电池、版本等）
+      try {
+        // 查询蓝牙名称、版本、电池、ANC模式、MTU和设备能力
+        // 0x03=INFO_BT_NAME, 0x02=INFO_VERSION, 0x01=INFO_POWER, 0x0C=INFO_ANC, 0xFF=INFO_MTU, 0xFE=INFO_DEV_CAP
+        await protocolRef.current?.queryDeviceInfo([0x03, 0x02, 0x01, 0x0C, 0xFF, 0xFE]);
+        console.log('✅ 设备信息查询成功');
+      } catch (error) {
+        console.warn('⚠️  设备信息查询失败:', error);
+        // 即使查询失败也继续运行，使用 BLE 设备名称
+      }
     });
 
     protocolRef.current.on('onDisconnected', () => {
