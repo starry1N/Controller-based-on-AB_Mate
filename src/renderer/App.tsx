@@ -225,11 +225,85 @@ const App: React.FC = () => {
     }
   };
 
-  const handleFindDevice = async (side: 'left' | 'right' | 'both') => {
+  const handleFindDevice = async (side: 'left' | 'right' | 'both' | 'stop') => {
     try {
       await protocolRef.current?.findDevice(side);
     } catch (error) {
       console.error('查找设备失败:', error);
+    }
+  };
+
+  const handleBluetoothNameChange = async (newName: string) => {
+    if (!newName.trim()) {
+      throw new Error('蓝牙名称不能为空');
+    }
+
+    const previousName = deviceInfo.bluetoothName;
+    const isNameChanged = newName !== previousName;
+
+    try {
+      console.log(`📝 更改蓝牙名称: "${previousName}" → "${newName}" (长度: ${newName.length}/32)`);
+      
+      // 乐观更新UI
+      setDeviceInfo((prev) => ({ ...prev, bluetoothName: newName }));
+
+      // 发送命令到设备
+      await protocolRef.current?.setBluetoothName(newName);
+      
+      // sendAndWait 已经在内部验证了响应，如果失败会抛出异常
+      // 如果执行到这里说明修改成功
+      console.log(`✅ 蓝牙名称修改成功: "${newName}"`);
+    } catch (error) {
+      console.error('❌ 蓝牙名称修改失败:', error);
+      
+      // 诊断信息
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (errorMsg.includes('功能未启用')) {
+        console.warn(
+          `\n💡 诊断信息:\n` +
+          `   • 固件可能未启用 BT_NAME 功能 (AB_MATE_BT_NAME_EN=0)\n` +
+          `   • 检查固件编译配置\n`
+        );
+      } else if (errorMsg.includes('TWS连接')) {
+        console.warn(
+          `\n💡 诊断信息:\n` +
+          `   • 如果使用真无线耳机，请确保:\n` +
+          `     - 左右耳都已连接，或\n` +
+          `     - 正处于配对模式\n`
+        );
+      }
+      
+      // 如果确实改变了名称，则回退
+      if (isNameChanged) {
+        setDeviceInfo((prev) => ({ ...prev, bluetoothName: previousName }));
+        console.log(`↩️  已回滚蓝牙名称: "${newName}" → "${previousName}"`);
+      }
+      
+      throw error;
+    }
+  };
+
+  const handleOTAUpgrade = async (file: File) => {
+    try {
+      console.log(`🔄 开始OTA升级: ${file.name}`);
+      await protocolRef.current?.startOTAUpgrade(file);
+      console.log('✅ OTA升级成功，设备将重启');
+      alert('✅ 固件升级成功！\n设备将在几秒内重启...');
+      
+      // 等待设备重启后重新连接
+      setTimeout(async () => {
+        console.log('⏳ 等待设备重启...');
+        setConnectionState(ConnectionState.DISCONNECTED);
+        // 可选：自动重新连接
+        setTimeout(() => {
+          console.log('🔄 尝试重新连接...');
+          handleConnect();
+        }, 5000);
+      }, 3000);
+      
+    } catch (error) {
+      console.error('❌ OTA升级失败:', error);
+      throw error;
     }
   };
 
@@ -255,6 +329,8 @@ const App: React.FC = () => {
               onFindDevice={handleFindDevice}
               onToggleMode={handleToggleMode}
               onVolumeChange={handleVolumeChange}
+              onBluetoothNameChange={handleBluetoothNameChange}
+              onOTAUpgrade={handleOTAUpgrade}
             />
 
             <ANCControl

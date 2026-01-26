@@ -11,6 +11,8 @@ interface DeviceInfoProps {
   onFindDevice: (side: 'left' | 'right' | 'both' | 'stop') => void;
   onToggleMode: () => void;
   onVolumeChange: (volume: number) => void;
+  onBluetoothNameChange?: (name: string) => void;
+  onOTAUpgrade?: (file: File) => void;
 }
 
 export const DeviceInfo: React.FC<DeviceInfoProps> = ({
@@ -18,11 +20,18 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
   onFindDevice,
   onToggleMode,
   onVolumeChange,
+  onBluetoothNameChange,
+  onOTAUpgrade,
 }) => {
   const [isFindingDevice, setIsFindingDevice] = useState(false);
   const [showFindOptions, setShowFindOptions] = useState(false);
   const [localMode, setLocalMode] = useState<ABMateDeviceMode>(ABMateDeviceMode.NORMAL);
   const [isTogglingMode, setIsTogglingMode] = useState(false);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editingName, setEditingName] = useState('');
+  const [isChangingName, setIsChangingName] = useState(false);
+  const [isUpgrading, setIsUpgrading] = useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   // 当设备模式更新时，同步本地状态
   useEffect(() => {
@@ -30,6 +39,13 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
       setLocalMode(deviceInfo.deviceMode);
     }
   }, [deviceInfo.deviceMode]);
+
+  // 初始化编辑名称
+  useEffect(() => {
+    if (deviceInfo.bluetoothName) {
+      setEditingName(deviceInfo.bluetoothName);
+    }
+  }, [deviceInfo.bluetoothName]);
 
   const handleFindDevice = (side: 'left' | 'right' | 'both') => {
     setIsFindingDevice(true);
@@ -43,9 +59,76 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
     return () => clearTimeout(timeout);
   };
 
+  const handleStartEditName = () => {
+    setIsEditingName(true);
+  };
+
+  const handleCancelEditName = () => {
+    setIsEditingName(false);
+    setEditingName(deviceInfo.bluetoothName || '');
+  };
+
+  const handleSaveBluetoothName = async () => {
+    if (!editingName.trim()) {
+      console.error('蓝牙名称不能为空');
+      return;
+    }
+
+    if (editingName === deviceInfo.bluetoothName) {
+      setIsEditingName(false);
+      return;
+    }
+
+    setIsChangingName(true);
+    try {
+      await onBluetoothNameChange?.(editingName.trim());
+      setIsEditingName(false);
+    } catch (error) {
+      console.error('设置蓝牙名称失败:', error);
+      // 恢复为原值
+      setEditingName(deviceInfo.bluetoothName || '');
+    } finally {
+      setIsChangingName(false);
+    }
+  };
+
   const handleStopFinding = () => {
     onFindDevice('stop');
     setIsFindingDevice(false);
+  };
+
+  // 处理OTA升级
+  const handleOTAClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    // 验证文件类型（根据固件文件扩展名调整）
+    const validExtensions = ['.bin', '.fw', '.hex'];
+    const fileExtension = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+    
+    if (!validExtensions.includes(fileExtension)) {
+      console.error('无效的固件文件格式，支持的格式:', validExtensions.join(', '));
+      alert(`无效的固件文件格式\n支持的格式: ${validExtensions.join(', ')}`);
+      event.target.value = ''; // 清空选择
+      return;
+    }
+
+    setIsUpgrading(true);
+    try {
+      console.log(`🔄 开始OTA升级: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+      await onOTAUpgrade?.(file);
+      console.log('✅ OTA升级成功');
+    } catch (error) {
+      console.error('❌ OTA升级失败:', error);
+      alert(`OTA升级失败: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsUpgrading(false);
+      event.target.value = ''; // 清空选择，允许再次选择同一文件
+    }
   };
 
   // 处理游戏模式切换
@@ -95,7 +178,52 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
       {/* 设备名称 */}
       {deviceInfo.bluetoothName && (
         <div className="device-name-section">
-          <h2>📱 {deviceInfo.bluetoothName}</h2>
+          {isEditingName ? (
+            <div className="name-edit-container">
+              <input
+                type="text"
+                className="name-input"
+                value={editingName}
+                onChange={(e) => setEditingName(e.target.value.substring(0, 32))}
+                placeholder="输入蓝牙名称"
+                maxLength={32}
+                disabled={isChangingName}
+                autoFocus
+              />
+              <div className="name-edit-controls">
+                <button
+                  className="name-btn save"
+                  onClick={handleSaveBluetoothName}
+                  disabled={isChangingName || !editingName.trim()}
+                  title="保存蓝牙名称"
+                >
+                  {isChangingName ? '保存中...' : '✓ 保存'}
+                </button>
+                <button
+                  className="name-btn cancel"
+                  onClick={handleCancelEditName}
+                  disabled={isChangingName}
+                  title="取消编辑"
+                >
+                  ✕ 取消
+                </button>
+              </div>
+              <p className="name-char-count">{editingName.length}/32</p>
+            </div>
+          ) : (
+            <div className="name-display-container">
+              <h2 onClick={handleStartEditName} className="device-name-display" title="点击编辑蓝牙名称">
+                📱 {deviceInfo.bluetoothName}
+              </h2>
+              <button
+                className="name-edit-btn"
+                onClick={handleStartEditName}
+                title="编辑蓝牙名称"
+              >
+                ✏️
+              </button>
+            </div>
+          )}
           {deviceInfo.firmwareVersion && (
             <p className="device-version">固件版本: {deviceInfo.firmwareVersion}</p>
           )}
@@ -164,6 +292,23 @@ export const DeviceInfo: React.FC<DeviceInfoProps> = ({
             {localMode === ABMateDeviceMode.GAME ? '游戏模式' : '普通模式'}
           </span>
         </button>
+
+        <button
+          className={`action-btn ota-btn ${isUpgrading ? 'upgrading' : ''}`}
+          onClick={handleOTAClick}
+          disabled={isUpgrading}
+          title={isUpgrading ? '正在升级固件...' : '升级固件'}
+        >
+          <span className="action-icon">{isUpgrading ? '⏳' : '🔄'}</span>
+          <span className="action-label">{isUpgrading ? '升级中' : 'OTA升级'}</span>
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".bin,.fw,.hex"
+          style={{ display: 'none' }}
+          onChange={handleFileSelect}
+        />
 
         <div className="find-device-group">
           <button

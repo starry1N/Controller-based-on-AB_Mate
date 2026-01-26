@@ -125,6 +125,7 @@ export class ABMateProtocol {
         0x01,  // INFO_POWER - 电池电量
         0x02,  // INFO_VERSION - 固件版本
         0x04,  // INFO_EQ - EQ 设置
+        0x06,  // INFO_VOL - 音量 ✅ 新增：初次连接时获取音量
         0x0C,  // INFO_ANC - ANC 模式
         0xFF,  // INFO_MTU - MTU 大小
         0xFE,  // INFO_DEV_CAP - 设备能力
@@ -353,6 +354,227 @@ export class ABMateProtocol {
     const payload = encoder.encode(name.substring(0, 32));
     const packet = this.buildPacket(ABMateCommand.BT_NAME_SET, ABMateCommandType.REQUEST, payload);
     await this.sendAndWait(packet);
+  }
+
+  /**
+   * OTA升级固件
+   * @param file 固件文件
+   */
+  async startOTAUpgrade(file: File): Promise<void> {
+    console.log(`🔄 OTA升级开始: ${file.name}, 大小: ${file.size} 字节`);
+    
+    // 读取文件数据
+    const fileData = await this.readFileAsArrayBuffer(file);
+    const fileBytes = new Uint8Array(fileData);
+    
+    // 步骤1: 发送OTA请求 (CMD_OTA_REQ 0xA0)
+    // 载荷格式: [文件大小(4B)][CRC32(4B)]
+    const fileSize = fileBytes.length;
+    const crc32 = this.calculateCRC32(fileBytes);
+    
+    const otaReqPayload = new Uint8Array(8);
+    otaReqPayload[0] = fileSize & 0xFF;
+    otaReqPayload[1] = (fileSize >> 8) & 0xFF;
+    otaReqPayload[2] = (fileSize >> 16) & 0xFF;
+    otaReqPayload[3] = (fileSize >> 24) & 0xFF;
+    otaReqPayload[4] = crc32 & 0xFF;
+    otaReqPayload[5] = (crc32 >> 8) & 0xFF;
+    otaReqPayload[6] = (crc32 >> 16) & 0xFF;
+    otaReqPayload[7] = (crc32 >> 24) & 0xFF;
+    
+    const otaReqPacket = this.buildPacket(ABMateCommand.OTA_REQ, ABMateCommandType.REQUEST, otaReqPayload);
+    console.log(`📤 发送OTA请求: 文件大小=${fileSize}, CRC32=0x${crc32.toString(16).padStart(8, '0')}`);
+    
+    console.log(`🔍 OTA_REQ 诊断信息:`);
+    console.log(`   - 报文长度: ${otaReqPacket.length} 字节`);
+    console.log(`   - 报文数据: ${Array.from(otaReqPacket).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+    console.log(`   - 当前SEQ: ${this.seq}`);
+    console.log(`   - 待处理请求: ${this.pendingRequests.size}`);
+    
+    let response = null;
+    try {
+      response = await this.sendAndWait(otaReqPacket, 10000);
+    } catch (error) {
+      console.error(`❌ OTA_REQ发送异常:`, error);
+      throw new Error(`OTA请求发送失败: ${error instanceof Error ? error.message : '未知错误'}`);
+    }
+    
+    if (!response) {
+      // 响应为null，可能是超时
+      console.error(`❌ OTA_REQ无响应 - 设备可能不支持OTA或未正确处理`);
+      console.error(`   💡 诊断建议:`);
+      console.error(`      1. 检查设备固件是否启用了 AB_MATE_OTA_EN`);
+      console.error(`      2. 检查OTA_REQ载荷格式 (当前: 8字节文件大小+CRC32)`);
+      console.error(`      3. 在设备端添加printf日志检查是否收到命令`);
+      console.error(`      4. 尝试重启设备`);
+      throw new Error(`OTA请求失败: 设备无响应，请检查固件是否支持OTA (AB_MATE_OTA_EN)`);
+    }
+    
+    if (response[0] !== 0) {
+      const errorCode = response[0];
+      const errorMsg = this.getOTAErrorMessage(errorCode);
+      console.error(`❌ OTA请求被拒绝 - 错误码: ${errorCode} (${errorMsg})`);
+      throw new Error(`OTA请求失败: ${errorMsg} (错误码=${errorCode})`);
+    }
+    
+    console.log('✅ OTA请求成功，开始传输数据...');
+    
+    // 步骤2: 分块传输固件数据（考虑BLE MTU限制）
+    // BLE标准MTU为251字节，减去头部7字节，实际可用约244字节
+    // 考虑分帧信息(8字节: 地址4B + 长度4B)，每块最多236字节
+    const BLOCK_SIZE = 236;  // 单块最大数据字节数
+    const OTA_PACKET_DELAY_MS = 30;  // 数据包发送间隔，避免GATT操作忙碌 (可调: 20-50ms)
+    const totalBlocks = Math.ceil(fileSize / BLOCK_SIZE);
+    let offset = 0;
+    let blockIndex = 0;
+    
+    while (offset < fileSize) {
+      const remainingBytes = fileSize - offset;
+      const blockSize = Math.min(BLOCK_SIZE, remainingBytes);
+      const blockData = fileBytes.slice(offset, offset + blockSize);
+      
+      // 构建数据包载荷
+      // 格式: [地址(4B)][数据长度(4B)][数据(N B)]
+      const dataPayload = new Uint8Array(8 + blockSize);
+      dataPayload[0] = offset & 0xFF;
+      dataPayload[1] = (offset >> 8) & 0xFF;
+      dataPayload[2] = (offset >> 16) & 0xFF;
+      dataPayload[3] = (offset >> 24) & 0xFF;
+      dataPayload[4] = blockSize & 0xFF;
+      dataPayload[5] = (blockSize >> 8) & 0xFF;
+      dataPayload[6] = (blockSize >> 16) & 0xFF;
+      dataPayload[7] = (blockSize >> 24) & 0xFF;
+      dataPayload.set(blockData, 8);
+      
+      const cmd = blockIndex === 0 ? ABMateCommand.OTA_DATA_START : ABMateCommand.OTA_DATA_CONTINUE;
+      
+      // 检查是否需要分帧（如果载荷超过250字节）
+      if (dataPayload.length > 250) {
+        // 分帧传输大数据包
+        const frameSize = 240;  // 每帧240字节（留出10字节安全余量）
+        const totalFrames = Math.ceil(dataPayload.length / frameSize);
+        
+        console.log(`📤 发送数据块 ${blockIndex + 1}/${totalBlocks} (分${totalFrames}帧): 地址=0x${offset.toString(16)}, 总长度=${dataPayload.length}`);
+        
+        for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+          const frameStart = frameIdx * frameSize;
+          const frameEnd = Math.min(frameStart + frameSize, dataPayload.length);
+          const frameData = dataPayload.slice(frameStart, frameEnd);
+          
+          const dataPacket = this.buildPacket(cmd, ABMateCommandType.REQUEST, frameData, {
+            frameSeq: frameIdx,
+            frameTotal: totalFrames - 1,
+          });
+          
+          const isLastFrame = frameIdx === totalFrames - 1;
+          
+          if (isLastFrame) {
+            // 最后一帧：等待设备响应
+            try {
+              const dataResponse = await this.sendAndWait(dataPacket, 10000);
+              if (!dataResponse || dataResponse[0] !== 0) {
+                throw new Error(`数据传输失败 (块${blockIndex + 1}, 帧${frameIdx + 1}/${totalFrames}): ${dataResponse ? `错误码=${dataResponse[0]}` : '无响应'}`);
+              }
+              console.log(`   ✓ 帧 ${frameIdx + 1}/${totalFrames} 传输成功 (最后一帧)`);
+            } catch (error) {
+              console.error(`❌ OTA数据传输失败:`, error);
+              // 尝试同步恢复
+              const syncOk = await this.syncWithDevice();
+              if (!syncOk) {
+                throw new Error(`OTA数据传输中断，同步失败`);
+              }
+              throw error;
+            }
+          } else {
+            // 中间帧：直接发送，不等待响应
+            this.sendPacket(dataPacket);
+            console.log(`   → 帧 ${frameIdx + 1}/${totalFrames} 已发送 (不等待响应)`);
+            
+            // 避免GATT操作忙碌，帧之间添加延迟
+            await this.delay(OTA_PACKET_DELAY_MS);
+          }
+        }
+      } else {
+        // 单帧传输
+        const dataPacket = this.buildPacket(cmd, ABMateCommandType.REQUEST, dataPayload);
+        
+        const progress = ((offset + blockSize) / fileSize * 100).toFixed(1);
+        console.log(`📤 发送数据块 ${blockIndex + 1}/${totalBlocks} (${progress}%): 地址=0x${offset.toString(16)}, 长度=${blockSize}`);
+        
+        // OTA数据块传输不需要等待响应，直接发送
+        this.sendPacket(dataPacket);
+        
+        // 避免GATT操作忙碌，块之间添加延迟
+        if (offset + blockSize < fileSize) {
+          await this.delay(OTA_PACKET_DELAY_MS);
+        }
+      }
+      
+      offset += blockSize;
+      blockIndex++;
+      
+      // 触发进度回调
+      this.callbacks.onOTAProgress?.(Math.round((offset / fileSize) * 100));
+    }
+    
+    console.log('✅ 固件数据传输完成');
+    
+    // 等待设备验证并重启
+    console.log('⏳ 等待设备验证固件...');
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    console.log('✅ OTA升级完成');
+  }
+
+  /**
+   * 获取OTA错误消息
+   */
+  private getOTAErrorMessage(errorCode: number): string {
+    const errorMap: { [key: number]: string } = {
+      0: '成功',
+      1: '失败',
+      2: '设备已连接通话',
+      3: '文件大小超限',
+      4: '版本号不符',
+      5: 'CRC校验失败',
+      6: '序列号错误',
+      255: '未知错误',
+    };
+    return errorMap[errorCode] || `未定义的错误(${errorCode})`;
+  }
+
+  /**
+   * 读取文件为ArrayBuffer
+   */
+  private readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as ArrayBuffer);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  /**
+   * 计算CRC32校验和
+   */
+  private calculateCRC32(data: Uint8Array): number {
+    let crc = 0xFFFFFFFF;
+    
+    for (let i = 0; i < data.length; i++) {
+      const byte = data[i];
+      crc = crc ^ byte;
+      
+      for (let j = 0; j < 8; j++) {
+        if (crc & 1) {
+          crc = (crc >>> 1) ^ 0xEDB88320;
+        } else {
+          crc = crc >>> 1;
+        }
+      }
+    }
+    
+    return (crc ^ 0xFFFFFFFF) >>> 0;
   }
 
   /**
@@ -1115,6 +1337,10 @@ export class ABMateProtocol {
       0x30: 'ANC_LEVEL_SET',
       0x31: 'TP_LEVEL_SET',
       0x32: 'V3D_AUDIO_SET',
+      0xA0: 'OTA_REQ',
+      0xA1: 'OTA_DATA_START',
+      0xA2: 'OTA_DATA_CONTINUE',
+      0xA3: 'OTA_STA',
       0xE0: 'CUSTOM',
     };
     
@@ -1151,32 +1377,6 @@ export class ABMateProtocol {
         case ABMateCommand.DEVICE_INFO_GET:
         case ABMateCommand.DEVICE_INFO_NOTIFY:
           this.parseDeviceInfo(payload);
-          break;
-
-        case ABMateCommand.EQ_GET:
-        case ABMateCommand.EQ_NOTIFY:
-          if (payload.length >= 11) {
-            const mode = payload[0];
-            const gains = Array.from(payload.slice(1, 11)).map(g => g - 12);
-            this.callbacks.onEQChanged?.({ mode, gains });
-            console.log(`🎵 EQ 已更新: 模式=${mode}, 增益=${gains}`);
-          }
-          break;
-
-        case ABMateCommand.BATT_GET:
-        case ABMateCommand.BATT_NOTIFY:
-          if (payload.length >= 3) {
-            this.callbacks.onBatteryUpdated?.(payload[0], payload[1], payload[2]);
-            console.log(`🔋 电池: L=${payload[0]}% R=${payload[1]}% Case=${payload[2]}%`);
-          }
-          break;
-
-        case ABMateCommand.ANC_LEVEL_GET:
-        case ABMateCommand.ANC_LEVEL_NOTIFY:
-          if (payload.length >= 2) {
-            this.callbacks.onANCModeChanged?.(payload[0], payload[1]);
-            console.log(`🔊 ANC: 模式=${payload[0]} 等级=${payload[1]}`);
-          }
           break;
 
         case ABMateCommand.ANC_SET:
@@ -1220,6 +1420,50 @@ export class ABMateProtocol {
             }
           }
           break;
+
+        case ABMateCommand.BT_NAME_SET:
+          // BT_NAME_SET 响应仅包含错误码（1字节）
+          // 响应格式: [PAYLOAD_LEN=1][RESULT_CODE]
+          // 错误码: 0=成功, 1=失败
+          if (payload.length >= 1) {
+            const resultCode = payload[0] as ABMateResult;
+            if (resultCode === ABMateResult.SUCCESS) {
+              console.log(`✅ 蓝牙名称设置成功: "${this.deviceInfo.bluetoothName}"`);
+              // 触发回调确保UI更新
+              this.callbacks.onDeviceInfoUpdated?.(this.deviceInfo);
+            } else {
+              console.warn(
+                `⚠️  蓝牙名称设置失败，错误码: ${resultCode}\n` +
+                `   可能原因:\n` +
+                `   1. 功能未启用 (AB_MATE_BT_NAME_EN=0)\n` +
+                `   2. TWS连接异常 (左右耳未连接)\n` +
+                `   3. 名称长度超过31字符\n` +
+                `   4. 设备处理错误`
+              );
+            }
+          }
+          break;
+
+        case ABMateCommand.OTA_REQ:
+        case ABMateCommand.OTA_DATA_START:
+        case ABMateCommand.OTA_DATA_CONTINUE:
+          // OTA命令响应仅包含错误码（1字节）
+          if (payload.length >= 1) {
+            const resultCode = payload[0];
+            if (resultCode === ABMateResult.SUCCESS) {
+              console.log(`✅ OTA命令执行成功: 0x${cmd.toString(16)}`);
+            } else {
+              console.warn(`⚠️  OTA命令执行失败: 0x${cmd.toString(16)}, 错误码: ${resultCode}`);
+            }
+          }
+          break;
+
+        case ABMateCommand.OTA_STA:
+          // OTA状态通知
+          if (payload.length >= 1) {
+            const status = payload[0];
+            console.log(`📊 OTA状态: ${status}`);
+          }
           break;
 
         default:
@@ -1368,6 +1612,7 @@ export class ABMateProtocol {
             typeStr = 'INFO_VOL (音量)';
             this.deviceInfo.volume = data[0];
             logValue = `${data[0]}%`;
+            this.callbacks.onVolumeChanged?.(data[0]);  // ✅ 触发音量变化回调，更新UI
             break;
 
           case 0x07: // INFO_PLAY_STA - 播放状态
@@ -1494,5 +1739,13 @@ export class ABMateProtocol {
       return `${data[0]}.${data[1]}.${data[2]}`;
     }
     return 'Unknown';
+  }
+
+  /**
+   * 延迟指定毫秒数
+   * @param ms 毫秒数
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }

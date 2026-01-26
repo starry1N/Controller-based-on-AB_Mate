@@ -42,6 +42,10 @@ export enum ABMateCommand {
   ANC_LEVEL_SET = 0x30,
   TP_LEVEL_SET = 0x31,
   V3D_AUDIO_SET = 0x32,
+  OTA_REQ = 0xa0,             // OTA升级请求
+  OTA_DATA_START = 0xa1,      // OTA数据开始
+  OTA_DATA_CONTINUE = 0xa2,   // OTA数据继续
+  OTA_STA = 0xa3,             // OTA状态上报
 }
 
 // ANC 模式枚举
@@ -178,4 +182,5 @@ export interface ABMateEvents {
   onANCModeChanged: (mode: ABMateANCMode, level: number) => void;
   onEQChanged: (config: ABMateEQConfig) => void;
   onError: (error: Error) => void;
+  onOTAProgress?: (progress: number) => void;
 }
