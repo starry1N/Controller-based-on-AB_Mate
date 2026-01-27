@@ -43,6 +43,11 @@ export class ABMateProtocol {
   private isSending: boolean = false;
   private maxQueueSize: number = 10;  // 队列最大长度
 
+  // OTA状态监听 - 用于等待设备验证完成
+  private otaStatusResolver?: (status: number) => void;
+  private otaStatusRejector?: (error: Error) => void;
+  private otaStatusTimeout?: NodeJS.Timeout;
+
   /**
    * 获取下一个序列号（0-15 循环）
    * 注意：序列号是 4 位字段，范围应该是 0-15
@@ -413,117 +418,258 @@ export class ABMateProtocol {
     if (response[0] !== 0) {
       const errorCode = response[0];
       const errorMsg = this.getOTAErrorMessage(errorCode);
+      
+      // ✅ 修复2: 如果是SEQ错误，尝试同步恢复
+      if (errorCode === 6) {  // FOT_ERR_SEQ
+        console.warn('⚠️ 检测到SEQ错误(错误码=6)，尝试与设备同步...');
+        try {
+          const syncOk = await this.syncWithDevice();
+          if (syncOk) {
+            console.log('✅ SEQ同步成功，重新开始OTA升级...');
+            return this.startOTAUpgrade(file);
+          } else {
+            console.error('❌ SEQ同步失败，无法继续');
+            throw new Error('OTA SEQ同步失败');
+          }
+        } catch (syncError) {
+          console.error('❌ 同步过程异常:', syncError);
+          throw new Error(`OTA请求失败: ${errorMsg} (同步异常)`);
+        }
+      }
+      
       console.error(`❌ OTA请求被拒绝 - 错误码: ${errorCode} (${errorMsg})`);
       throw new Error(`OTA请求失败: ${errorMsg} (错误码=${errorCode})`);
     }
     
     console.log('✅ OTA请求成功，开始传输数据...');
     
-    // 步骤2: 分块传输固件数据（考虑BLE MTU限制）
-    // BLE标准MTU为251字节，减去头部7字节，实际可用约244字节
-    // 考虑分帧信息(8字节: 地址4B + 长度4B)，每块最多236字节
-    const BLOCK_SIZE = 236;  // 单块最大数据字节数
-    const OTA_PACKET_DELAY_MS = 30;  // 数据包发送间隔，避免GATT操作忙碌 (可调: 20-50ms)
-    const totalBlocks = Math.ceil(fileSize / BLOCK_SIZE);
-    let offset = 0;
+    // 步骤2: 分块传输固件数据
+    // 
+    // 🔧 OTA协议完整说明（基于固件ab_mate_ota.c分析）：
+    // 
+    // 1. 块结构：
+    //    - FOT_BLOCK_LEN = 512字节（设备端缓冲区 fot_data[512]）
+    //    - 文件按512字节一块分割
+    //    - 每块通过 OTA_DATA_START 开始新块
+    // 
+    // 2. OTA_DATA_START格式：[地址(4B)][块大小(4B)][首批数据]
+    //    - 地址：文件中的字节偏移
+    //    - 块大小：本块的总字节数（≤512）
+    //    - 设备行为：fot_var.total_len = 块大小，fot_var.remain_len = 块大小 - 首批数据长度
+    //    - ⚠️ 关键检查（ab_mate_ota.c:650）：if(fot_var.remain_len) → 0x41错误
+    //      说明：发送新的OTA_DATA_START时，上一个块必须传输完成（remain_len=0）
+    // 
+    // 3. OTA_DATA_CONTINUE格式：[纯数据]
+    //    - 无头部，直接是数据
+    //    - 设备行为：fot_var.remain_len -= 数据长度
+    //    - ⚠️ 关键检查（ab_mate_ota.c:683）：if(fot_var.remain_len < recv_data_len) → 0x41错误
+    //      说明：发送的数据不能超过剩余长度
+    // 
+    // 4. 块完成：
+    //    - 当 remain_len = 0 时，fot_recv_ok = 1
+    //    - 设备写入flash（app_fota_write）
+    //    - 然后可以发送下一个块的OTA_DATA_START
+    // 
+    // 5. MTU限制：
+    //    - BLE MTU = 251字节
+    //    - 头部7字节 → 可用载荷244字节
+    //    - OTA_DATA_START: 8字节头 + 最多236字节数据
+    //    - OTA_DATA_CONTINUE: 最多244字节数据
+    //
+    // 6. 帧限制（ab_mate_app.c:2084）：
+    //    - OTA命令必须是单帧（frame_total=0）
+    //    - 如果分帧，设备会缓存到多帧接收完成，然后调用ab_mate_receive_proc_do()
+    //    - 但OTA命令需要调用ab_mate_ota_proc()，所以分帧会导致处理错误
+    //    - 因此每个OTA数据包的载荷必须 ≤ 244字节
+    
+    const FOT_BLOCK_LEN = 512;              // 设备缓冲区大小
+    const BLE_MTU = 251;                    // BLE MTU
+    const PACKET_HEADER = 7;                // AB-Mate协议头部
+    const MTU_PAYLOAD = BLE_MTU - PACKET_HEADER;  // 244字节可用载荷
+    const OTA_START_HEADER = 8;             // OTA_DATA_START头部：地址(4B)+块大小(4B)
+    const MAX_DATA_PER_START = MTU_PAYLOAD - OTA_START_HEADER;  // 236字节
+    const MAX_DATA_PER_CONTINUE = MTU_PAYLOAD;  // 244字节
+    const OTA_PACKET_DELAY_MS = 30;         // 包间隔（避免GATT忙碌）
+    
+    const totalBlocks = Math.ceil(fileSize / FOT_BLOCK_LEN);
+    let fileOffset = 0;
     let blockIndex = 0;
     
-    while (offset < fileSize) {
-      const remainingBytes = fileSize - offset;
-      const blockSize = Math.min(BLOCK_SIZE, remainingBytes);
-      const blockData = fileBytes.slice(offset, offset + blockSize);
+    console.log(`📊 OTA传输参数: 总块数=${totalBlocks}, 块大小=${FOT_BLOCK_LEN}B, MTU载荷=${MTU_PAYLOAD}B`);
+    
+    while (fileOffset < fileSize) {
+      // 计算本块大小（最后一块可能小于512字节）
+      const blockSize = Math.min(FOT_BLOCK_LEN, fileSize - fileOffset);
+      const blockData = fileBytes.slice(fileOffset, fileOffset + blockSize);
       
-      // 构建数据包载荷
-      // 格式: [地址(4B)][数据长度(4B)][数据(N B)]
-      const dataPayload = new Uint8Array(8 + blockSize);
-      dataPayload[0] = offset & 0xFF;
-      dataPayload[1] = (offset >> 8) & 0xFF;
-      dataPayload[2] = (offset >> 16) & 0xFF;
-      dataPayload[3] = (offset >> 24) & 0xFF;
-      dataPayload[4] = blockSize & 0xFF;
-      dataPayload[5] = (blockSize >> 8) & 0xFF;
-      dataPayload[6] = (blockSize >> 16) & 0xFF;
-      dataPayload[7] = (blockSize >> 24) & 0xFF;
-      dataPayload.set(blockData, 8);
+      // ========== 发送 OTA_DATA_START ==========
+      const firstChunkSize = Math.min(blockSize, MAX_DATA_PER_START);
+      const startPayload = new Uint8Array(OTA_START_HEADER + firstChunkSize);
       
-      const cmd = blockIndex === 0 ? ABMateCommand.OTA_DATA_START : ABMateCommand.OTA_DATA_CONTINUE;
+      // 填充文件偏移地址（小端序）
+      startPayload[0] = fileOffset & 0xFF;
+      startPayload[1] = (fileOffset >> 8) & 0xFF;
+      startPayload[2] = (fileOffset >> 16) & 0xFF;
+      startPayload[3] = (fileOffset >> 24) & 0xFF;
       
-      // 检查是否需要分帧（如果载荷超过250字节）
-      if (dataPayload.length > 250) {
-        // 分帧传输大数据包
-        const frameSize = 240;  // 每帧240字节（留出10字节安全余量）
-        const totalFrames = Math.ceil(dataPayload.length / frameSize);
-        
-        console.log(`📤 发送数据块 ${blockIndex + 1}/${totalBlocks} (分${totalFrames}帧): 地址=0x${offset.toString(16)}, 总长度=${dataPayload.length}`);
-        
-        for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
-          const frameStart = frameIdx * frameSize;
-          const frameEnd = Math.min(frameStart + frameSize, dataPayload.length);
-          const frameData = dataPayload.slice(frameStart, frameEnd);
-          
-          const dataPacket = this.buildPacket(cmd, ABMateCommandType.REQUEST, frameData, {
-            frameSeq: frameIdx,
-            frameTotal: totalFrames - 1,
-          });
-          
-          const isLastFrame = frameIdx === totalFrames - 1;
-          
-          if (isLastFrame) {
-            // 最后一帧：等待设备响应
-            try {
-              const dataResponse = await this.sendAndWait(dataPacket, 10000);
-              if (!dataResponse || dataResponse[0] !== 0) {
-                throw new Error(`数据传输失败 (块${blockIndex + 1}, 帧${frameIdx + 1}/${totalFrames}): ${dataResponse ? `错误码=${dataResponse[0]}` : '无响应'}`);
-              }
-              console.log(`   ✓ 帧 ${frameIdx + 1}/${totalFrames} 传输成功 (最后一帧)`);
-            } catch (error) {
-              console.error(`❌ OTA数据传输失败:`, error);
-              // 尝试同步恢复
-              const syncOk = await this.syncWithDevice();
-              if (!syncOk) {
-                throw new Error(`OTA数据传输中断，同步失败`);
-              }
-              throw error;
-            }
-          } else {
-            // 中间帧：直接发送，不等待响应
-            this.sendPacket(dataPacket);
-            console.log(`   → 帧 ${frameIdx + 1}/${totalFrames} 已发送 (不等待响应)`);
-            
-            // 避免GATT操作忙碌，帧之间添加延迟
-            await this.delay(OTA_PACKET_DELAY_MS);
-          }
-        }
-      } else {
-        // 单帧传输
-        const dataPacket = this.buildPacket(cmd, ABMateCommandType.REQUEST, dataPayload);
-        
-        const progress = ((offset + blockSize) / fileSize * 100).toFixed(1);
-        console.log(`📤 发送数据块 ${blockIndex + 1}/${totalBlocks} (${progress}%): 地址=0x${offset.toString(16)}, 长度=${blockSize}`);
-        
-        // OTA数据块传输不需要等待响应，直接发送
-        this.sendPacket(dataPacket);
-        
-        // 避免GATT操作忙碌，块之间添加延迟
-        if (offset + blockSize < fileSize) {
-          await this.delay(OTA_PACKET_DELAY_MS);
-        }
+      // 填充块总大小（小端序） - 这个值很关键！
+      startPayload[4] = blockSize & 0xFF;
+      startPayload[5] = (blockSize >> 8) & 0xFF;
+      startPayload[6] = (blockSize >> 16) & 0xFF;
+      startPayload[7] = (blockSize >> 24) & 0xFF;
+      
+      // 填充首批数据
+      startPayload.set(blockData.slice(0, firstChunkSize), OTA_START_HEADER);
+      
+      // 构建数据包（必须是单帧，frame_total=0）
+      const startPacket = this.buildPacket(
+        ABMateCommand.OTA_DATA_START,
+        ABMateCommandType.REQUEST,
+        startPayload
+      );
+      
+      // 验证载荷大小不超过MTU
+      if (startPayload.length > MTU_PAYLOAD) {
+        throw new Error(`❌ OTA_DATA_START载荷过大: ${startPayload.length} > ${MTU_PAYLOAD}`);
       }
       
-      offset += blockSize;
+      const progress = ((fileOffset + blockSize) / fileSize * 100).toFixed(1);
+      console.log(`📤 块${blockIndex + 1}/${totalBlocks} (${progress}%): OTA_DATA_START [SEQ:${this.seq}]`);
+      console.log(`   地址=0x${fileOffset.toString(16).padStart(8,'0')}, 块大小=${blockSize}B, 首批=${firstChunkSize}B, 载荷=${startPayload.length}B`);
+      
+      await this.bleService.writeWithoutResponse(startPacket);
+      // ⚠️ 关键：发送后立即递增序列号（设备期望每个命令都有不同的SEQ）
+      this.seq = (this.seq + 1) & 0x0F;
+      console.log(`   → SEQ已递增至: ${this.seq}`);
+      await this.delay(OTA_PACKET_DELAY_MS);
+      
+      // ========== 发送 OTA_DATA_CONTINUE（如果需要）==========
+      let sentInBlock = firstChunkSize;
+      let continueIndex = 0;
+      
+      while (sentInBlock < blockSize) {
+        const remainingInBlock = blockSize - sentInBlock;
+        const continueChunkSize = Math.min(remainingInBlock, MAX_DATA_PER_CONTINUE);
+        const continuePayload = blockData.slice(sentInBlock, sentInBlock + continueChunkSize);
+        
+        // 构建CONTINUE数据包
+        const continuePacket = this.buildPacket(
+          ABMateCommand.OTA_DATA_CONTINUE,
+          ABMateCommandType.REQUEST,
+          continuePayload
+        );
+        
+        // 验证载荷大小
+        if (continuePayload.length > MTU_PAYLOAD) {
+          throw new Error(`❌ OTA_DATA_CONTINUE载荷过大: ${continuePayload.length} > ${MTU_PAYLOAD}`);
+        }
+        
+        continueIndex++;
+        console.log(`   → CONTINUE #${continueIndex} [SEQ:${this.seq}]: ${continueChunkSize}B, 块内剩余=${remainingInBlock - continueChunkSize}B`);
+        
+        await this.bleService.writeWithoutResponse(continuePacket);
+        // ⚠️ 关键：发送后立即递增序列号
+        this.seq = (this.seq + 1) & 0x0F;
+        console.log(`     SEQ已递增至: ${this.seq}`);
+        await this.delay(OTA_PACKET_DELAY_MS);
+        
+        sentInBlock += continueChunkSize;
+      }
+      
+      // 块传输完成
+      console.log(`   ✅ 块${blockIndex + 1}传输完成`);
+      console.log(`      → 块大小: ${blockSize}B, 已发送: ${sentInBlock}B`);
+      console.log(`      → 首批(START): ${firstChunkSize}B + CONTINUE: ${sentInBlock - firstChunkSize}B = ${sentInBlock}B`);
+      if (sentInBlock !== blockSize) {
+        console.warn(`      ❌ 发送数据不完整！期望=${blockSize}B, 实际=${sentInBlock}B`);
+      }
+      
+      fileOffset += blockSize;
       blockIndex++;
       
       // 触发进度回调
-      this.callbacks.onOTAProgress?.(Math.round((offset / fileSize) * 100));
+      this.callbacks.onOTAProgress?.(Math.round((fileOffset / fileSize) * 100));
     }
     
     console.log('✅ 固件数据传输完成');
+    console.log(`   📊 总计: ${fileSize}字节, ${blockIndex}个块, 所有块已完整发送`);
+    console.log(`   ⏳ 现在等待设备验证固件...（设备需要1-3秒验证CRC32并写入FLASH）`);
     
-    // 等待设备验证并重启
+    // ⏳ 等待设备验证并重启（监听 CMD_OTA_STA NOTIFY）
     console.log('⏳ 等待设备验证固件...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
     
-    console.log('✅ OTA升级完成');
+    try {
+      const otaStatus = await this.waitForOTACompletion(10000);  // 10秒超时
+      
+      if (otaStatus === 0xFF) {
+        // ✅ 成功完成
+        console.log('✅ OTA升级成功！设备将在3秒后重启');
+        this.callbacks.onOTAComplete?.();
+      } else if (otaStatus === 0xFE) {
+        // 进行中
+        console.log('📊 设备仍在处理中...');
+        // 继续等待
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        // ❌ 错误状态
+        const errorMsg = this.getOTAErrorMessage(otaStatus);
+        console.error(`❌ OTA验证失败: 状态码=0x${otaStatus.toString(16)}, ${errorMsg}`);
+        throw new Error(`OTA验证失败: ${errorMsg}`);
+      }
+      
+      console.log('✅ OTA升级流程完成');
+    } catch (error) {
+      console.error(`❌ 等待OTA完成失败:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * 等待OTA完成 - 监听设备发送的 CMD_OTA_STA NOTIFY
+   * @param timeoutMs 超时时间（毫秒）
+   * @returns OTA状态码
+   */
+  private waitForOTACompletion(timeoutMs: number = 10000): Promise<number> {
+    return new Promise((resolve, reject) => {
+      // 清除之前的超时
+      if (this.otaStatusTimeout) {
+        clearTimeout(this.otaStatusTimeout);
+      }
+
+      // 设置新的超时
+      this.otaStatusTimeout = setTimeout(() => {
+        this.otaStatusResolver = undefined;
+        this.otaStatusRejector = undefined;
+        console.error(`❌ OTA验证超时！${timeoutMs}ms后仍未收到设备响应`);
+        console.error(`   诊断信息:`);
+        console.error(`   1. 检查设备是否仍连接: 使用 queryDeviceInfo() 查询`);
+        console.error(`   2. 设备端OTA流程是否正常: 检查设备日志`);
+        console.error(`   3. 是否正确发送了最后一块数据: 查看上面的日志`);
+        console.error(`   4. 设备验证花费时间太长: 尝试增加超时时间`);
+        reject(new Error(`OTA状态等待超时（${timeoutMs}ms）- 设备可能未接收完整数据或验证失败`));
+      }, timeoutMs);
+
+      // 设置回调
+      this.otaStatusResolver = (status) => {
+        if (this.otaStatusTimeout) {
+          clearTimeout(this.otaStatusTimeout);
+          this.otaStatusTimeout = undefined;
+        }
+        this.otaStatusResolver = undefined;
+        this.otaStatusRejector = undefined;
+        resolve(status);
+      };
+
+      this.otaStatusRejector = (error) => {
+        if (this.otaStatusTimeout) {
+          clearTimeout(this.otaStatusTimeout);
+          this.otaStatusTimeout = undefined;
+        }
+        this.otaStatusResolver = undefined;
+        this.otaStatusRejector = undefined;
+        reject(error);
+      };
+    });
   }
 
   /**
@@ -1501,6 +1647,31 @@ export class ABMateProtocol {
 
       case ABMateCommand.EQ_SET:
         this.parseEQInfo(packet.payload);
+        break;
+
+      case ABMateCommand.OTA_STA:
+        // OTA状态通知 - 设备验证完成后发送
+        if (packet.payload.length >= 1) {
+          const otaStatus = packet.payload[0];
+          console.log(`📊 OTA状态通知: 0x${otaStatus.toString(16).padStart(2, '0')}`);
+          
+          // 映射状态
+          const statusMap: { [key: number]: string } = {
+            0xFE: '升级进行中 (FOT_UPDATE_CONTINUE)',
+            0xFF: '升级成功 (FOT_UPDATE_DONE)',
+            0x40: '序列号错误 (FOT_ERR_SEQ)',
+            0x41: '数据长度错误 (FOT_ERR_DATA_LEN)',
+          };
+          
+          const statusMsg = statusMap[otaStatus] || `未知状态 (0x${otaStatus.toString(16)})`;
+          console.log(`   状态信息: ${statusMsg}`);
+          
+          // 如果有OTA状态监听器，调用它
+          if (this.otaStatusResolver) {
+            console.log(`   ✅ 已解析OTA状态，触发回调`);
+            this.otaStatusResolver(otaStatus);
+          }
+        }
         break;
 
       default:

@@ -183,4 +183,5 @@ export interface ABMateEvents {
   onEQChanged: (config: ABMateEQConfig) => void;
   onError: (error: Error) => void;
   onOTAProgress?: (progress: number) => void;
+  onOTAComplete?: () => void;  // OTA升级成功完成的回调
 }
