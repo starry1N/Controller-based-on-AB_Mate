@@ -37,7 +37,10 @@ jobs:
     - name: 🤖 同步 Capacitor
       run: npx cap sync android
 
-    - name: 🔑 设置签名密钥
+    - name: � 修复 gradlew 权限
+      run: chmod +x android/gradlew
+
+    - name: �🔑 设置签名密钥
       run: |
         cd android
         echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
