@@ -1,85 +1,54 @@
-name: Build Android APK
+﻿name: Build Android APK
 
 on:
   push:
     branches: [ main, master, develop ]
   pull_request:
     branches: [ main, master, develop ]
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: 📥 检出代码
+    - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: 🔧 设置 Node.js
+    - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
         cache: 'npm'
 
-    - name: 🔧 设置 Java
+    - name: Setup Java
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
         java-version: '17'
         cache: gradle
 
-    - name: 📦 安装 npm 依赖
+    - name: Install dependencies
       run: npm ci
 
-    - name: 🏗️ 构建 Web 应用
+    - name: Build web app
       run: npm run build:prod
 
-    - name: 🤖 同步 Capacitor
+    - name: Sync Capacitor
       run: npx cap sync android
 
-    - name: � 修复 gradlew 权限
+    - name: Fix gradlew permissions
       run: chmod +x android/gradlew
 
-    - name: �🔑 设置签名密钥
-      run: |
-        echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    - name: Create local.properties for Android SDK
+      run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
 
-    - name: 🏗️ 构建 Android APK (Debug)
+    - name: Build Debug APK
       run: cd android && ./gradlew assembleDebug
-      if: github.event_name != 'push' || github.ref != 'refs/heads/main'
 
-    - name: 🏗️ 构建 Android APK (Release)
-      run: cd android && ./gradlew assembleRelease
-      env:
-        ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    - name: 📤 上传 Debug APK
+    - name: Upload Debug APK artifacts
       uses: actions/upload-artifact@v4
-      if: always()
       with:
         name: APK-Debug
         path: android/app/build/outputs/apk/debug/
         retention-days: 7
-
-    - name: 📤 上传 Release APK
-      uses: actions/upload-artifact@v4
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      with:
-        name: APK-Release
-        path: android/app/build/outputs/apk/release/
-        retention-days: 30
-
-    - name: 📤 上传到 GitHub Release（可选）
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          android/app/build/outputs/apk/release/app-release.apk
-        draft: true
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
