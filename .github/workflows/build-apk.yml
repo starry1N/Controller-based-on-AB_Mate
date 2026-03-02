@@ -42,9 +42,7 @@ jobs:
 
     - name: �🔑 设置签名密钥
       run: |
-        cd android
-        echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
-        cd ..
+        echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     - name: 🏗️ 构建 Android APK (Debug)
@@ -55,7 +53,7 @@ jobs:
       run: |
         cd android
         ./gradlew assembleRelease \
-          -Pandroid.injected.signing.store.file=release.keystore \
+          -Pandroid.injected.signing.store.file=./app/release.keystore \
           -Pandroid.injected.signing.store.password=${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
           -Pandroid.injected.signing.key.alias=${{ secrets.ANDROID_KEY_ALIAS }} \
           -Pandroid.injected.signing.key.password=${{ secrets.ANDROID_KEY_PASSWORD }}
